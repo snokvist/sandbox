@@ -30,6 +30,7 @@
 #define TX_POWER_ADJUST_MAX 500    // Maximum adjustment: 500 mBm (5 dBm)
 
 #define ROUND_UP_TO_NEAREST_100(x) (((x) + 99) / 100 * 100)
+#define ROUND_TO_NEAREST_100(x) (((x) + 50) / 100 * 100)
 
 #define HYSTERESIS_OFFSET_RSSI 12
 #define HYSTERESIS_OFFSET_SNR 6
@@ -39,6 +40,9 @@
 #define FEC_LIMIT_DEFAULT 50
 #define LOST_LIMIT_DEFAULT 5
 #define RECOVER_TIMEOUT_DEFAULT 10  // in seconds
+
+#define SET_DELAY_DEFAULT_MS 2000   // Default delay of 2000ms between TX power adjustments
+#define RX_ANT_TIMEOUT_DEFAULT 5    // Default RX_ANT timeout of 5 seconds
 
 #define MAX_BUFFER_SIZE 1024
 #define MAX_LINE_LENGTH 512
@@ -71,8 +75,8 @@ typedef struct {
     pid_control_type_t pid_control_type;
     int target_value;
 
-    unsigned int fec_limit;       // Changed to unsigned int
-    unsigned int lost_limit;      // Changed to unsigned int
+    unsigned int fec_limit;
+    unsigned int lost_limit;
     int recover_timeout;
 
     int alink_enabled;
@@ -104,6 +108,17 @@ typedef struct {
     int tcp_server_fd;
     volatile sig_atomic_t signal_received;
     volatile sig_atomic_t terminate;
+
+    int set_delay_ms;                // Minimum delay between TX power adjustments in milliseconds
+    struct timespec last_tx_adjust_time;  // Timestamp of the last TX power adjustment
+
+    struct timespec last_rx_ant_time;     // Timestamp of the last RX_ANT line processed
+    int rx_ant_timeout;                   // RX_ANT timeout duration in seconds
+    int rx_ant_timeout_triggered;         // Flag to indicate if the timeout action has been triggered
+
+    double error_threshold;               // Error threshold for making adjustments
+
+    int in_fallback_state;                // Flag indicating if we're in fallback state
 
     // For command-line argument parsing
     int argc;
@@ -212,6 +227,12 @@ void print_help(const char *program_name) {
     printf("                         Values must be between 1 and 100.\n");
     printf("  --recover-timeout=SEC  Set recovery timeout in seconds (default: %d)\n", RECOVER_TIMEOUT_DEFAULT);
     printf("  --alink                Enable hysteresis logic and script execution\n");
+    printf("  --set-delay=MS         Minimum delay between TX power adjustments in milliseconds (default: %d)\n", SET_DELAY_DEFAULT_MS);
+    printf("  --rx-ant-timeout=SEC   Set RX_ANT timeout duration in seconds (default: %d)\n", RX_ANT_TIMEOUT_DEFAULT);
+    printf("  --kp=VALUE             Set proportional gain Kp for PID controller (default: %.1f)\n", 50.0);
+    printf("  --ki=VALUE             Set integral gain Ki for PID controller (default: %.1f)\n", 0.0);
+    printf("  --kd=VALUE             Set derivative gain Kd for PID controller (default: %.1f)\n", 0.0);
+    printf("  --error-threshold=VAL  Set error threshold for adjustments (default: %.1f)\n", 1.0);
 }
 
 /**
@@ -249,9 +270,11 @@ void initialize_config(tx_ctrl_config_t *config) {
     config->integral = 0.0;
     config->previous_error = 0.0;
 
-    config->Kp = 1.0;
-    config->Ki = 0.1;
-    config->Kd = 0.05;
+    config->Kp = 50.0;  // Default proportional gain
+    config->Ki = 0.0;   // Default integral gain
+    config->Kd = 0.0;   // Default derivative gain
+
+    config->error_threshold = 1.0; // Default error threshold
 
     config->total_packets = 0;
     config->lost_packets = 0;
@@ -264,6 +287,18 @@ void initialize_config(tx_ctrl_config_t *config) {
     config->tcp_server_fd = -1;
     config->signal_received = 0;
     config->terminate = 0;
+
+    config->set_delay_ms = SET_DELAY_DEFAULT_MS;  // Default delay of 2000ms
+    config->last_tx_adjust_time.tv_sec = 0;
+    config->last_tx_adjust_time.tv_nsec = 0;
+
+    config->rx_ant_timeout = RX_ANT_TIMEOUT_DEFAULT; // Default RX_ANT timeout of 5 seconds
+    clock_gettime(CLOCK_MONOTONIC, &config->last_rx_ant_time);
+    config->rx_ant_timeout_triggered = 0;
+
+    config->current_tx_power = -1;  // Uninitialized
+
+    config->in_fallback_state = 0; // Not in fallback state initially
 }
 
 /**
@@ -291,6 +326,12 @@ int parse_arguments(tx_ctrl_config_t *config) {
         {"lost-limit",    required_argument, 0,  0 },
         {"recover-timeout", required_argument, 0, 0 },
         {"alink",         no_argument,       0,  0 },
+        {"set-delay",     required_argument, 0,  0 },
+        {"rx-ant-timeout", required_argument, 0,  0 },
+        {"kp",            required_argument, 0,  0 },
+        {"ki",            required_argument, 0,  0 },
+        {"kd",            required_argument, 0,  0 },
+        {"error-threshold", required_argument, 0, 0 },
         {0, 0, 0, 0}
     };
 
@@ -377,6 +418,42 @@ int parse_arguments(tx_ctrl_config_t *config) {
             }
         } else if (strcmp(long_options[option_index].name, "alink") == 0) {
             config->alink_enabled = 1;
+        } else if (strcmp(long_options[option_index].name, "set-delay") == 0) {
+            config->set_delay_ms = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0' || config->set_delay_ms < 0) {
+                fprintf(stderr, "Invalid set-delay. Must be a non-negative integer.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "rx-ant-timeout") == 0) {
+            config->rx_ant_timeout = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0' || config->rx_ant_timeout < 1) {
+                fprintf(stderr, "Invalid rx-ant-timeout. Must be greater than 0.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "kp") == 0) {
+            config->Kp = strtod(optarg, &endptr);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid Kp value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "ki") == 0) {
+            config->Ki = strtod(optarg, &endptr);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid Ki value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "kd") == 0) {
+            config->Kd = strtod(optarg, &endptr);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid Kd value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "error-threshold") == 0) {
+            config->error_threshold = strtod(optarg, &endptr);
+            if (*endptr != '\0' || config->error_threshold <= 0.0) {
+                fprintf(stderr, "Invalid error-threshold value. Must be greater than 0.\n");
+                return -1;
+            }
         }
     }
 
@@ -552,11 +629,18 @@ void main_loop(tx_ctrl_config_t *config) {
             if (current_time.tv_sec >= config->pid_paused_until) {
                 config->pid_control_enabled = 1;
                 config->pid_paused_until = 0;
+                // Note: Do not reset in_fallback_state here
                 // Reset PID controller variables if needed
                 config->integral = 0.0;
                 config->previous_error = 0.0;
                 if (config->verbose) {
                     printf("PID control resumed after recovery timeout.\n");
+                }
+
+                // Re-evaluate hysteresis state and call scripts if necessary
+                if (config->ema_initialized && config->alink_enabled) {
+                    double current_value = (config->pid_control_type == PID_CONTROL_RSSI) ? config->ema_rssi : config->ema_snr;
+                    update_hysteresis(config, current_value);
                 }
             }
         }
@@ -600,6 +684,33 @@ void main_loop(tx_ctrl_config_t *config) {
             if (config->manual_mode_enabled && config->tcp_server_fd != -1 && FD_ISSET(config->tcp_server_fd, &read_fds)) {
                 // Accept new connection and process command
                 process_tcp_connection(config);
+            }
+        }
+
+        // Check if RX_ANT timeout has been exceeded
+        struct timespec current_time;
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+
+        double elapsed_time = (current_time.tv_sec - config->last_rx_ant_time.tv_sec) +
+                              (current_time.tv_nsec - config->last_rx_ant_time.tv_nsec) / 1e9;
+
+        if (elapsed_time >= config->rx_ant_timeout && !config->rx_ant_timeout_triggered &&
+            config->pid_control_enabled && !config->manual_mode_enabled) {
+            // RX_ANT timeout exceeded, take action
+            adjust_tx_power(config, config->tx_power_max);
+            config->pid_control_enabled = 0;
+            config->pid_paused_until = current_time.tv_sec + config->recover_timeout;
+            config->rx_ant_timeout_triggered = 1; // Set the flag to prevent repeated triggers
+            config->in_fallback_state = 1; // Enter fallback state
+
+            if (config->verbose) {
+                printf("No RX_ANT stats received for %.1f seconds. TX power set to max and PID control paused for %d seconds.\n",
+                       elapsed_time, config->recover_timeout);
+            }
+
+            // Call fallback script
+            if (config->alink_enabled) {
+                call_script(config, "tx_fallback.sh", "");
             }
         }
 
@@ -717,15 +828,19 @@ void process_line(tx_ctrl_config_t *config, const char *line) {
                 }
 
                 if (config->verbose) {
+                    printf("-------------------------\n");
                     printf("Timestamp: %" PRIu64 "\n", timestamp);
                     printf("Antenna ID: %d\n", antenna_id);
                     printf("EMA RSSI: %.2f dBm\n", config->ema_rssi);
                     printf("EMA SNR: %.2f dB\n", config->ema_snr);
-                    printf("-------------------------\n");
                 }
 
-                // Hysteresis logic
-                if (config->alink_enabled && config->pid_control_enabled) {
+                // Update last_rx_ant_time
+                clock_gettime(CLOCK_MONOTONIC, &config->last_rx_ant_time);
+                config->rx_ant_timeout_triggered = 0; // Reset the timeout trigger flag
+
+                // Update hysteresis logic regardless of PID control state
+                if (config->alink_enabled) {
                     double current_value = (config->pid_control_type == PID_CONTROL_RSSI) ? config->ema_rssi : config->ema_snr;
                     update_hysteresis(config, current_value);
                 }
@@ -746,9 +861,10 @@ void process_line(tx_ctrl_config_t *config, const char *line) {
                     // Adjust TX power
                     adjust_tx_power(config, tx_power);
                 } else if (!config->pid_control_enabled && !config->manual_mode_enabled) {
-                    // If PID control is disabled and not in manual mode, set TX power to max
+                    // If PID control is disabled and not in manual mode, maintain TX power at max
                     adjust_tx_power(config, config->tx_power_max);
                 }
+
             } else {
                 if (config->verbose) {
                     fprintf(stderr, "Failed to parse RX_ANT stats in line: %s\n", line);
@@ -791,6 +907,7 @@ void process_line(tx_ctrl_config_t *config, const char *line) {
                     // Set tx power to maximum and pause PID controller
                     adjust_tx_power(config, config->tx_power_max);
                     config->pid_control_enabled = 0;
+                    config->in_fallback_state = 1; // Enter fallback state
                     struct timespec current_time;
                     clock_gettime(CLOCK_MONOTONIC, &current_time);
                     config->pid_paused_until = current_time.tv_sec + config->recover_timeout;
@@ -800,7 +917,7 @@ void process_line(tx_ctrl_config_t *config, const char *line) {
                     }
                     // Call fallback script
                     if (config->alink_enabled) {
-                        call_script(config, "/usr/bin/tx_fallback.sh", "");
+                        call_script(config, "tx_fallback.sh", "");
                     }
                 }
             } else {
@@ -830,9 +947,34 @@ void process_line(tx_ctrl_config_t *config, const char *line) {
  * @return 0 on success, -1 on failure.
  */
 int adjust_tx_power(tx_ctrl_config_t *config, int tx_power) {
+    int ret;
+
+    // Check if TX power has changed
+    if (tx_power == config->current_tx_power) {
+        if (config->verbose) {
+            printf("TX power remains the same (%d mBm). No adjustment needed.\n", tx_power);
+        }
+        return 0;
+    }
+
+    // Enforce minimum delay between adjustments
+    struct timespec current_time;
+    clock_gettime(CLOCK_MONOTONIC, &current_time);
+
+    long elapsed_ms = (current_time.tv_sec - config->last_tx_adjust_time.tv_sec) * 1000 +
+                      (current_time.tv_nsec - config->last_tx_adjust_time.tv_nsec) / 1000000;
+
+    if (elapsed_ms < config->set_delay_ms) {
+        if (config->verbose) {
+            printf("Minimum delay between TX adjustments not met (%ld ms elapsed, %d ms required). Skipping adjustment.\n",
+                   elapsed_ms, config->set_delay_ms);
+        }
+        return 0;
+    }
+
+    // Proceed to adjust TX power
     char *args[8];
     char tx_power_str[16];
-    int ret;
 
     // Adjust tx_power sign for rtl8812au
     int adjusted_tx_power = tx_power;
@@ -852,22 +994,25 @@ int adjust_tx_power(tx_ctrl_config_t *config, int tx_power) {
     args[7] = NULL;
 
     if (config->verbose) {
-        printf("Adjusting TX power to %d mBm\n", tx_power);
+        printf("Adjusting TX power from %d mBm to %d mBm\n", config->current_tx_power, tx_power);
     }
 
-    ret = execute_command("/sbin/iw", args);
+    ret = execute_command("iw", args);
 
     if (ret != 0) {
         fprintf(stderr, "Failed to set TX power.\n");
         return -1;
     }
 
+    // Update current TX power and timestamp
     config->current_tx_power = tx_power;
+    config->last_tx_adjust_time = current_time;
+
     return 0;
 }
 
 /**
- * @brief Executes a command without invoking the shell.
+ * @brief Executes a command using execvp.
  * @param command The command to execute.
  * @param argv The argument vector.
  * @return The exit status of the command.
@@ -876,15 +1021,22 @@ int execute_command(const char *command, char *const argv[]) {
     pid_t pid;
     int status;
 
+    if (config.verbose) {
+        printf("Executing command: %s\n", command);
+        for (int i = 0; argv[i] != NULL; i++) {
+            printf(" arg[%d]: %s\n", i, argv[i]);
+        }
+    }
+
     pid = fork();
     if (pid == -1) {
         perror("fork");
         return -1;
     } else if (pid == 0) {
         // Child process
-        execv(command, argv);
-        // If execv returns, an error occurred
-        perror("execv");
+        execvp(command, argv);
+        // If execvp returns, an error occurred
+        perror("execvp");
         _exit(EXIT_FAILURE);
     } else {
         // Parent process
@@ -919,33 +1071,39 @@ int calculate_pid_output(tx_ctrl_config_t *config, double current_value) {
     double derivative = error - config->previous_error;
     config->previous_error = error;
 
+    // Calculate PID output
     double output = config->Kp * error + config->Ki * config->integral + config->Kd * derivative;
 
     // Map the PID output to an adjustment in tx_power
     int tx_power_change = (int)(output);
 
-    // Limit the tx_power_change to be within tx_power_adjust_min and tx_power_adjust_max
+    // Limit tx_power_change to allowed maximum
     if (tx_power_change > config->tx_power_adjust_max) {
         tx_power_change = config->tx_power_adjust_max;
     } else if (tx_power_change < -config->tx_power_adjust_max) {
         tx_power_change = -config->tx_power_adjust_max;
     }
 
-    // Ensure the change is at least tx_power_adjust_min if not zero
-    if (tx_power_change > 0 && tx_power_change < config->tx_power_adjust_min) {
-        tx_power_change = config->tx_power_adjust_min;
-    } else if (tx_power_change < 0 && tx_power_change > -config->tx_power_adjust_min) {
-        tx_power_change = -config->tx_power_adjust_min;
+    // Round tx_power_change to nearest 100 mBm
+    tx_power_change = ROUND_TO_NEAREST_100(tx_power_change);
+
+    // Ensure tx_power_change is at least tx_power_adjust_min when error is significant
+    if (fabs(error) >= config->error_threshold) {
+        if (tx_power_change > 0 && tx_power_change < config->tx_power_adjust_min) {
+            tx_power_change = config->tx_power_adjust_min;
+        } else if (tx_power_change < 0 && tx_power_change > -config->tx_power_adjust_min) {
+            tx_power_change = -config->tx_power_adjust_min;
+        }
+    } else {
+        tx_power_change = 0;
     }
 
-    // Calculate the new tx_power by adding the change, ensure within tx_power_min and tx_power_max
+    // Calculate the new tx_power by adding the change
     int tx_power = config->current_tx_power + tx_power_change;
 
+    // Ensure tx_power is within tx_power_min and tx_power_max
     if (tx_power > config->tx_power_max) tx_power = config->tx_power_max;
     if (tx_power < config->tx_power_min) tx_power = config->tx_power_min;
-
-    // Round tx_power to nearest 100 mBm
-    tx_power = ROUND_UP_TO_NEAREST_100(tx_power);
 
     return tx_power;
 }
@@ -958,6 +1116,7 @@ int calculate_pid_output(tx_ctrl_config_t *config, double current_value) {
 void update_hysteresis(tx_ctrl_config_t *config, double current_value) {
     hysteresis_state_t previous_state = config->hysteresis_state;
 
+    // Determine the new hysteresis state based on current value
     if (current_value > config->hysteresis_value) {
         config->hysteresis_state = HYSTERESIS_STATE_HIGH;
     } else if (current_value <= config->hysteresis_value && current_value >= config->deadband_lower) {
@@ -966,13 +1125,24 @@ void update_hysteresis(tx_ctrl_config_t *config, double current_value) {
         config->hysteresis_state = HYSTERESIS_STATE_LOW;
     }
 
-    if (previous_state != config->hysteresis_state) {
-        if (config->hysteresis_state == HYSTERESIS_STATE_HIGH && previous_state <= HYSTERESIS_STATE_DEADBAND) {
-            // Moving from low to high signal past hysteresis point
-            call_script(config, "/usr/bin/tx_high_signal.sh", "up");
-        } else if (config->hysteresis_state == HYSTERESIS_STATE_LOW && previous_state >= HYSTERESIS_STATE_DEADBAND) {
-            // Moving from high to low signal past hysteresis point
-            call_script(config, "/usr/bin/tx_low_signal.sh", "down");
+    if (config->in_fallback_state) {
+        // Transitioning from fallback state to any other state
+        config->in_fallback_state = 0; // Reset fallback state flag
+
+        // Call the appropriate script with "up" argument
+        if (config->hysteresis_state == HYSTERESIS_STATE_HIGH) {
+            call_script(config, "tx_high_signal.sh", "up");
+        } else {
+            call_script(config, "tx_low_signal.sh", "up");
+        }
+    } else if (previous_state != config->hysteresis_state) {
+        // Normal hysteresis logic
+        if (config->hysteresis_state == HYSTERESIS_STATE_HIGH && previous_state != HYSTERESIS_STATE_HIGH) {
+            // Moving to high signal past hysteresis point
+            call_script(config, "tx_high_signal.sh", "up");
+        } else if (config->hysteresis_state == HYSTERESIS_STATE_LOW && previous_state != HYSTERESIS_STATE_LOW) {
+            // Moving to low signal past hysteresis point
+            call_script(config, "tx_low_signal.sh", "down");
         }
     }
 }
@@ -989,15 +1159,18 @@ void call_script(tx_ctrl_config_t *config, const char *script_name, const char *
 
     // Enforce timeout between script calls
     if (current_time.tv_sec - config->last_script_call_time >= config->recover_timeout) {
+        if (config->verbose) {
+            printf("Executing script: %s %s\n", script_name, argument);
+        }
         pid_t pid = fork();
         if (pid == -1) {
             perror("fork");
             return;
         } else if (pid == 0) {
             // Child process
-            execl(script_name, script_name, argument, (char *)NULL);
-            // If execl returns, an error occurred
-            perror("execl");
+            execlp(script_name, script_name, argument, (char *)NULL);
+            // If execlp returns, an error occurred
+            perror("execlp");
             _exit(EXIT_FAILURE);
         } else {
             // Parent process
@@ -1040,10 +1213,13 @@ void initialize_hysteresis(tx_ctrl_config_t *config) {
  * @param config Pointer to the configuration structure.
  */
 void initialize_tx_power(tx_ctrl_config_t *config) {
-    config->current_tx_power = config->tx_power_min;
-    adjust_tx_power(config, config->current_tx_power);
-    if (config->verbose) {
-        printf("Initial TX power set to MIN: %d mBm\n", config->current_tx_power);
+    if (adjust_tx_power(config, config->tx_power_min) == 0) {
+        config->current_tx_power = config->tx_power_min;
+        if (config->verbose) {
+            printf("Initial TX power set to MIN: %d mBm\n", config->tx_power_min);
+        }
+    } else {
+        fprintf(stderr, "Failed to set initial TX power.\n");
     }
 }
 
@@ -1062,10 +1238,14 @@ void print_current_settings(tx_ctrl_config_t *config) {
            config->pid_control_type == PID_CONTROL_RSSI ? "dBm (RSSI)" : "dB (SNR)");
     printf("  PID Control using: %s\n", config->pid_control_type == PID_CONTROL_RSSI ? "RSSI" : "SNR");
     printf("  PID Control enabled: %s\n", config->pid_control_enabled ? "Yes" : "No");
+    printf("  PID Parameters: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", config->Kp, config->Ki, config->Kd);
+    printf("  Error Threshold: %.2f\n", config->error_threshold);
     printf("  FEC Limit: %u\n", config->fec_limit);
     printf("  Lost Limit: %u\n", config->lost_limit);
     printf("  Recover Timeout: %d seconds\n", config->recover_timeout);
     printf("  A-Link Enabled: %s\n", config->alink_enabled ? "Yes" : "No");
+    printf("  Set Delay: %d ms\n", config->set_delay_ms);
+    printf("  RX_ANT Timeout: %d seconds\n", config->rx_ant_timeout);
     if (config->alink_enabled) {
         printf("  Hysteresis Value: %.2f\n", config->hysteresis_value);
         printf("  Deadband Lower Limit: %.2f\n", config->deadband_lower);
