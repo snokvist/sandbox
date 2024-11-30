@@ -1,0 +1,1 @@
+arm-linux-gnueabihf-gcc -Wall -Wextra tx_ctrl.c -o tx_ctrl
