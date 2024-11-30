@@ -1,219 +1,260 @@
-# `tx_ctrl.c` Program Overview
+tx_ctrl - TX Power Control Program
+tx_ctrl is a C program designed to dynamically adjust the transmission (TX) power of a wireless interface based on real-time RSSI (Received Signal Strength Indicator) or SNR (Signal-to-Noise Ratio) values. It incorporates a PID (Proportional-Integral-Derivative) controller for fine-tuned adjustments and includes hysteresis logic (A-Link) for managing state transitions and executing external scripts during significant link changes.
 
-The `tx_ctrl.c` program is a tool designed to dynamically adjust the transmission (TX) power of a wireless network interface based on real-time signal metrics such as RSSI (Received Signal Strength Indicator) or SNR (Signal-to-Noise Ratio). It uses a PID (Proportional-Integral-Derivative) controller to maintain a target signal level and can execute external scripts when certain signal thresholds are crossed.
-
-## Features
-
-- **Dynamic TX Power Adjustment**: Automatically adjusts the TX power to maintain a target RSSI or SNR value.
-- **PID Controller**: Uses a PID control algorithm to calculate the necessary TX power adjustments.
-- **Hysteresis Logic**: Implements hysteresis to prevent rapid toggling when signal levels fluctuate around thresholds.
-- **Script Execution**: Executes external scripts when signal levels cross predefined hysteresis points.
-- **Manual Mode**: Allows manual control of TX power via a TCP socket interface.
-- **Signal Handling**: Responds to signals (`SIGUSR1`, `SIGUSR2`, `SIGINT`, `SIGTERM`) to control program behavior.
-- **Robust Error Handling**: Includes input validation and error checking for reliable operation.
-- **Resource Management**: Properly manages system resources, ensuring cleanup upon termination.
-
-## Program Behavior
-
-### Initialization
-
-Upon startup, the program:
-
-1. **Parses Command-Line Arguments**: Reads and validates the provided options.
-2. **Sets Up Signal Handlers**: Registers handlers for `SIGUSR1`, `SIGUSR2`, `SIGINT`, and `SIGTERM`.
-3. **Initializes Variables**: Sets default values for parameters like TX power limits, PID constants, and hysteresis thresholds.
-4. **Starts Main Loop**: Enters the main processing loop to read input and adjust TX power accordingly.
-
-### Main Processing Loop
-
-The program continuously performs the following:
-
-- **Reads Input**: Processes lines from standard input, which should contain signal metrics and packet statistics.
-- **Updates Signal Metrics**: Calculates exponential moving averages (EMA) for RSSI and SNR.
-- **Adjusts TX Power**: If PID control is enabled, calculates the new TX power based on the PID algorithm.
-- **Executes Hysteresis Logic**: Checks if the signal has crossed hysteresis thresholds and executes scripts if necessary.
-- **Handles Manual Mode**: If manual mode is activated, listens for commands on a TCP socket to adjust TX power directly.
-- **Responds to Signals**: Adjusts behavior based on received signals (e.g., switching modes, terminating).
-
-## Command-Line Arguments
-
-The program accepts several command-line arguments to configure its behavior:
-
-### `--help`
-
-Displays the help message and exits.
-
-```bash
-$ ./tx_ctrl --help
-
---verbose
-Enables verbose output, providing detailed information during execution.
+Table of Contents
+Features
+Requirements
+Compilation and Installation
+Usage
+Command-Line Options
+Examples
+Functionality Overview
+PID Controller
+Hysteresis Logic (A-Link)
+Fallback Mechanism
+External Scripts
+Signals and Manual Mode
+Testing and Tuning
+License
+Contributing
+Features
+Dynamic TX Power Adjustment: Adjusts the TX power based on real-time RSSI or SNR values.
+PID Control: Utilizes a PID controller for smooth and stable TX power adjustments.
+Hysteresis Logic (A-Link): Implements hysteresis to prevent frequent toggling between states and executes external scripts during significant link changes.
+Fallback Mechanism: Detects high packet loss or FEC errors and increases TX power to maximum for recovery.
+Manual Mode: Allows manual control of TX power via TCP commands.
+Configurable Parameters: Offers extensive command-line options to customize behavior.
+Requirements
+Operating System: Linux-based systems.
+Dependencies: None (standard C libraries and system calls).
+Permissions: Requires root privileges to adjust TX power settings via iw.
+Compilation and Installation
+Clone the Repository:
 
 bash
 Kopiera kod
-$ ./tx_ctrl --verbose [other options]
---wlanid=ID (Required)
-Specifies the network interface name to control. This argument is mandatory.
+git clone https://github.com/yourusername/tx_ctrl.git
+cd tx_ctrl
+Compile the Program:
 
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 [other options]
---card-type=NAME
-Specifies the WiFi card type. Supported options are:
-
-rtl8812eu
-rtl8812au
-rtl8733bu
-Example:
+gcc -Wall -Wextra tx_ctrl.c -o tx_ctrl
+The -Wall and -Wextra flags enable all compiler warnings, which is good practice.
+Set Executable Permissions (if needed):
 
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --card-type=rtl8812eu
---tx-min=VALUE
-Overrides the minimum TX power (in mBm). Values must be between 100 and 3000 and are rounded up to the nearest 100 mBm.
+chmod +x tx_ctrl
+Install (optional):
+
+You can move the executable to a directory in your PATH, such as /usr/local/bin.
 
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --tx-min=200
---tx-max=VALUE
-Overrides the maximum TX power (in mBm). Values must be between 100 and 3000 and are rounded up to the nearest 100 mBm.
+sudo mv tx_ctrl /usr/local/bin/
+Usage
+The tx_ctrl program reads input lines from stdin and adjusts the TX power of a specified wireless interface accordingly.
+
+Command-Line Options
+plaintext
+Kopiera kod
+Usage: tx_ctrl [OPTIONS]
+
+Options:
+  --help                 Show this help message and exit
+  --verbose              Enable verbose output
+  --wlanid=ID            Specify the network interface name (required)
+  --card-type=NAME       Specify WiFi card type:
+                           'rtl8812eu'
+                           'rtl8812au'
+                           'rtl8733bu'
+                         (default: rtl8812eu)
+  --tx-min=VALUE         Override minimum TX power (in mBm)
+  --tx-max=VALUE         Override maximum TX power (in mBm)
+                         Values must be between 100 and 3000, rounded up to nearest 100.
+  --target-value=VAL     Set target RSSI/SNR value (default: -70 for RSSI, 20 for SNR)
+  --pid-control=TYPE     Use 'rssi' or 'snr' for PID controller (default: rssi)
+  --fec-limit=VALUE      Set FEC recovered packets limit (default: 50)
+  --lost-limit=VALUE     Set lost packets limit (default: 5)
+                         Values must be between 1 and 100.
+  --recover-timeout=SEC  Set recovery timeout in seconds (default: 10)
+  --alink                Enable hysteresis logic and script execution
+  --set-delay=MS         Minimum delay between TX power adjustments in milliseconds (default: 2000)
+  --rx-ant-timeout=SEC   Set RX_ANT timeout duration in seconds (default: 5)
+  --kp=VALUE             Set proportional gain Kp for PID controller (default: 50.0)
+  --ki=VALUE             Set integral gain Ki for PID controller (default: 0.0)
+  --kd=VALUE             Set derivative gain Kd for PID controller (default: 0.0)
+  --error-threshold=VAL  Set error threshold for adjustments (default: 1.0)
+Examples
+Basic Usage:
 
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --tx-max=2800
---target-value=VAL
-Sets the target RSSI or SNR value for the PID controller.
-
-For RSSI (default), values are in dBm (e.g., -70).
-For SNR, values are in dB (e.g., 20).
-Example:
+sudo ./tx_ctrl --wlanid=wlan0
+Adjusts TX power of wlan0 using default settings.
+Enable Verbose Output:
 
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --target-value=-75
---pid-control=TYPE
-Specifies whether to use rssi or snr for the PID controller. Default is rssi.
+sudo ./tx_ctrl --wlanid=wlan0 --verbose
+Specify Card Type and TX Power Limits:
 
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --pid-control=snr
---fec-limit=VALUE
-Sets the FEC (Forward Error Correction) recovered packets limit. When exceeded, the program takes corrective action.
-
-Default: 50
-Range: 1 to 100
-bash
-Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --fec-limit=60
---lost-limit=VALUE
-Sets the lost packets limit. When exceeded, the program takes corrective action.
-
-Default: 5
-Range: 1 to 100
-bash
-Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --lost-limit=10
---recover-timeout=SEC
-Sets the recovery timeout in seconds. This defines how long the PID controller remains paused after taking corrective action.
-
-Default: 10
-bash
-Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --recover-timeout=15
---alink
-Enables the hysteresis logic and script execution feature.
+sudo ./tx_ctrl --wlanid=wlan0 --card-type=rtl8812au --tx-min=100 --tx-max=2000
+Set Target RSSI and Use SNR for PID Control:
 
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --alink
-Hysteresis Logic and Script Execution
-When the --alink option is enabled, the program monitors signal levels and executes external scripts when certain thresholds are crossed.
-
-Hysteresis Calculation
-For RSSI:
-Hysteresis value: target_value - 12
-Deadband lower limit: hysteresis_value - 6
-For SNR:
-Hysteresis value: target_value - 6
-Deadband lower limit: hysteresis_value - 3
-Script Execution
-Scripts are executed when the signal crosses hysteresis points:
-
-Low to High Signal Transition:
-
-Script: /usr/bin/tx_high_signal.sh
-Argument: up
-High to Low Signal Transition:
-
-Script: /usr/bin/tx_low_signal.sh
-Argument: down
-Fallback Action (when FEC or lost packet limits are exceeded):
-
-Script: /usr/bin/tx_fallback.sh
-Example of Script Invocation:
+sudo ./tx_ctrl --wlanid=wlan0 --pid-control=snr --target-value=25
+Enable A-Link Hysteresis Logic:
 
 bash
 Kopiera kod
-/usr/bin/tx_high_signal.sh up
-Timeout Enforcement
-To prevent excessive script execution, scripts are not called more frequently than the recover_timeout value.
+sudo ./tx_ctrl --wlanid=wlan0 --alink
+Customize PID Parameters:
 
+bash
+Kopiera kod
+sudo ./tx_ctrl --wlanid=wlan0 --kp=60.0 --ki=0.5 --kd=0.1 --error-threshold=0.5
+Set Minimum Delay Between Adjustments:
+
+bash
+Kopiera kod
+sudo ./tx_ctrl --wlanid=wlan0 --set-delay=1000
+Set RX_ANT Timeout Duration:
+
+bash
+Kopiera kod
+sudo ./tx_ctrl --wlanid=wlan0 --rx-ant-timeout=10
+Functionality Overview
+PID Controller
+Purpose: Adjusts TX power to maintain the target RSSI or SNR value.
+Parameters:
+Kp: Proportional gain. Increases responsiveness.
+Ki: Integral gain. Eliminates steady-state error.
+Kd: Derivative gain. Reduces overshoot and oscillations.
+Error Threshold: Minimum error required to trigger an adjustment.
+Hysteresis Logic (A-Link)
+Purpose: Prevents frequent toggling between high and low signal states.
+States:
+High Signal: Signal strength above the hysteresis threshold.
+Deadband: Signal strength within a neutral range.
+Low Signal: Signal strength below the deadband lower limit.
+Scripts: Executes external scripts during transitions.
+tx_high_signal.sh: Called when entering high signal state.
+tx_low_signal.sh: Called when entering low signal state.
+tx_fallback.sh: Called when entering fallback state.
+Fallback Mechanism
+Trigger Conditions:
+High number of FEC recovered packets.
+High number of lost packets.
+RX_ANT timeout exceeded.
+Actions:
+Sets TX power to maximum.
+Pauses PID control for a specified recovery timeout.
+Executes tx_fallback.sh script.
+Recovery:
+Monitors link status during suppression period.
+Transitions out of fallback state when link recovers.
+Calls appropriate scripts with "up" argument upon recovery.
+External Scripts
+The program calls external scripts to handle significant link state transitions.
+
+Script Execution:
+Scripts are executed using execlp.
+Ensure scripts are executable and located in a directory in the system PATH.
+Scripts:
+tx_high_signal.sh up: Called when transitioning to a higher signal state.
+tx_low_signal.sh down: Called when transitioning to a lower signal state.
+tx_low_signal.sh up: Called when recovering from fallback to a low signal state.
+tx_fallback.sh: Called when entering the fallback state.
+Script Examples
+tx_high_signal.sh:
+
+bash
+Kopiera kod
+#!/bin/bash
+echo "High signal detected. Action: $1"
+# Add your custom actions here
+tx_low_signal.sh:
+
+bash
+Kopiera kod
+#!/bin/bash
+echo "Low signal detected. Action: $1"
+# Add your custom actions here
+tx_fallback.sh:
+
+bash
+Kopiera kod
+#!/bin/bash
+echo "Fallback state triggered."
+# Add your custom actions here
+Make Scripts Executable:
+
+bash
+Kopiera kod
+chmod +x tx_high_signal.sh tx_low_signal.sh tx_fallback.sh
+Signals and Manual Mode
+Supported Signals
+SIGUSR1: Switches to PID control mode.
+SIGUSR2: Switches to manual mode.
 Manual Mode
-The program can be switched to manual mode using the SIGUSR2 signal. In manual mode, you can control the TX power via a TCP socket.
-
-Activating Manual Mode
-Send the SIGUSR2 signal to the process:
-
-bash
-Kopiera kod
-$ kill -USR2 <pid>
-Controlling TX Power
-Connect to the TCP server on localhost port 9995 (can use telnet or nc):
-
-bash
-Kopiera kod
-$ telnet localhost 9995
+Purpose: Allows manual control of TX power via TCP commands.
+Usage:
+Send SIGUSR2 to the process to enable manual mode.
+The program listens on TCP port 9995 for commands.
 Commands:
-
-set_tx X% : Sets the TX power to X% of the maximum value.
-Example: set_tx 50%
-set mode pid : Exits manual mode and resumes PID control.
-Exiting Manual Mode
-Send the SIGUSR1 signal to the process:
+set_tx <percentage>: Sets TX power to the specified percentage between tx-min and tx-max.
+set mode pid: Switches back to PID control mode.
+Example: Enabling Manual Mode
+Send SIGUSR2 to Process:
 
 bash
 Kopiera kod
-$ kill -USR1 <pid>
-Signal Handling
-The program responds to the following signals:
+kill -SIGUSR2 <pid_of_tx_ctrl>
+Send Command via TCP:
 
-SIGUSR1: Enables PID control and exits manual mode.
-SIGUSR2: Enters manual mode.
-SIGINT / SIGTERM: Initiates graceful shutdown.
-Input Processing
-The program reads input from standard input, which should be lines containing signal metrics and packet statistics.
-
-Expected Input Format
-RX_ANT Lines: Contain RSSI and SNR values.
-
-Example:
-
-ruby
-Kopiera kod
-15594044 RX_ANT 5805:2:20 1 5:-39:-38:-38:29:33:37
-PKT Lines: Contain packet statistics.
-
-Example:
-
-Kopiera kod
-15594044 PKT 5:200:0:5:0:0:0:2:0
-Error Handling and Logging
-Verbose Mode: When enabled, provides detailed logging of operations and any errors encountered.
-Input Validation: Checks all inputs and command-line arguments for validity.
-Resource Cleanup: Ensures that all resources are properly released upon termination.
-Example Usage
 bash
 Kopiera kod
-$ ./tx_ctrl --wlanid=wlan0 --card-type=rtl8812eu --tx-min=100 --tx-max=2800 \
-            --target-value=-70 --pid-control=rssi --fec-limit=50 --lost-limit=5 \
-            --recover-timeout=10 --alink --verbose
+echo "set_tx 75" | nc localhost 9995
+Switch Back to PID Mode:
+
+bash
+Kopiera kod
+echo "set mode pid" | nc localhost 9995
+Testing and Tuning
+Run the Program with Desired Parameters:
+
+bash
+Kopiera kod
+sudo ./tx_ctrl --wlanid=wlan0 --verbose --kp=60.0 --ki=0.5 --kd=0.1 --error-threshold=0.5 --alink
+Monitor the Output:
+
+Verbose mode provides detailed information about adjustments and state transitions.
+Adjust PID Parameters:
+
+Increase Kp: More aggressive response to error.
+Increase Ki: Eliminates steady-state errors over time.
+Increase Kd: Reduces overshoot and dampens oscillations.
+Adjust Hysteresis Parameters:
+
+Modify HYSTERESIS_OFFSET_RSSI, HYSTERESIS_OFFSET_SNR, DEAD_BAND_HALF_RSSI, and DEAD_BAND_HALF_SNR in the source code as needed.
+Test Fallback Mechanism:
+
+Simulate high packet loss or FEC errors.
+Verify that the program enters fallback state and executes tx_fallback.sh.
+Ensure that upon recovery, the appropriate script is called with "up" argument.
+Monitor Script Execution:
+
+Check that scripts are called at the correct times with correct arguments.
+Use logging within scripts for verification.
+License
+MIT License
+
+Contributing
+Contributions are welcome! Please open an issue or submit a pull request on GitHub.
+
+Note: Ensure that you have the necessary permissions and that you comply with all applicable laws and regulations when adjusting wireless transmission power and handling network interfaces.
