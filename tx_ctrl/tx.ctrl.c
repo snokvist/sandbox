@@ -10,10 +10,12 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <math.h>
+#include <getopt.h>        // For getopt_long and related definitions
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <sys/wait.h>      // For waitpid
 
 // Constants and Macros
 #define INTERFACE_NAME_DEFAULT "wlan0"
@@ -69,8 +71,8 @@ typedef struct {
     pid_control_type_t pid_control_type;
     int target_value;
 
-    int fec_limit;
-    int lost_limit;
+    unsigned int fec_limit;       // Changed to unsigned int
+    unsigned int lost_limit;      // Changed to unsigned int
     int recover_timeout;
 
     int alink_enabled;
@@ -292,6 +294,8 @@ int parse_arguments(tx_ctrl_config_t *config) {
         {0, 0, 0, 0}
     };
 
+    optind = 1; // Reset optind to 1 before parsing
+
     while ((opt = getopt_long(config->argc, config->argv, "", long_options, &option_index)) != -1) {
         if (opt == '?') {
             // Unknown option
@@ -352,17 +356,19 @@ int parse_arguments(tx_ctrl_config_t *config) {
                 return -1;
             }
         } else if (strcmp(long_options[option_index].name, "fec-limit") == 0) {
-            config->fec_limit = (int)strtol(optarg, &endptr, 10);
-            if (*endptr != '\0' || config->fec_limit < 1 || config->fec_limit > 100) {
+            unsigned long val = strtoul(optarg, &endptr, 10);
+            if (*endptr != '\0' || val < 1 || val > 100) {
                 fprintf(stderr, "Invalid fec-limit. Must be between 1 and 100.\n");
                 return -1;
             }
+            config->fec_limit = (unsigned int)val;
         } else if (strcmp(long_options[option_index].name, "lost-limit") == 0) {
-            config->lost_limit = (int)strtol(optarg, &endptr, 10);
-            if (*endptr != '\0' || config->lost_limit < 1 || config->lost_limit > 100) {
+            unsigned long val = strtoul(optarg, &endptr, 10);
+            if (*endptr != '\0' || val < 1 || val > 100) {
                 fprintf(stderr, "Invalid lost-limit. Must be between 1 and 100.\n");
                 return -1;
             }
+            config->lost_limit = (unsigned int)val;
         } else if (strcmp(long_options[option_index].name, "recover-timeout") == 0) {
             config->recover_timeout = (int)strtol(optarg, &endptr, 10);
             if (*endptr != '\0' || config->recover_timeout < 1) {
@@ -676,6 +682,7 @@ void process_line(tx_ctrl_config_t *config, const char *line) {
         return;
     }
     strncpy(type, token, sizeof(type) - 1);
+    type[sizeof(type) - 1] = '\0'; // Ensure null-termination
 
     // Handle different types
     if (strcmp(type, "RX_ANT") == 0) {
@@ -823,9 +830,8 @@ void process_line(tx_ctrl_config_t *config, const char *line) {
  * @return 0 on success, -1 on failure.
  */
 int adjust_tx_power(tx_ctrl_config_t *config, int tx_power) {
-    char *args[7];
+    char *args[8];
     char tx_power_str[16];
-    char interface_arg[32];
     int ret;
 
     // Adjust tx_power sign for rtl8812au
@@ -835,7 +841,6 @@ int adjust_tx_power(tx_ctrl_config_t *config, int tx_power) {
     }
 
     snprintf(tx_power_str, sizeof(tx_power_str), "%d", adjusted_tx_power);
-    snprintf(interface_arg, sizeof(interface_arg), "dev %s", config->interface_name);
 
     args[0] = "iw";
     args[1] = "dev";
@@ -1057,8 +1062,8 @@ void print_current_settings(tx_ctrl_config_t *config) {
            config->pid_control_type == PID_CONTROL_RSSI ? "dBm (RSSI)" : "dB (SNR)");
     printf("  PID Control using: %s\n", config->pid_control_type == PID_CONTROL_RSSI ? "RSSI" : "SNR");
     printf("  PID Control enabled: %s\n", config->pid_control_enabled ? "Yes" : "No");
-    printf("  FEC Limit: %d\n", config->fec_limit);
-    printf("  Lost Limit: %d\n", config->lost_limit);
+    printf("  FEC Limit: %u\n", config->fec_limit);
+    printf("  Lost Limit: %u\n", config->lost_limit);
     printf("  Recover Timeout: %d seconds\n", config->recover_timeout);
     printf("  A-Link Enabled: %s\n", config->alink_enabled ? "Yes" : "No");
     if (config->alink_enabled) {
