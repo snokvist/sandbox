@@ -1,0 +1,1795 @@
+// tx_ctrl.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <inttypes.h>
+#include <time.h>
+#include <errno.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <math.h>
+#include <getopt.h>        // For getopt_long and related definitions
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <sys/wait.h>      // For waitpid
+#include <ctype.h>         // For isspace
+
+// Constants and Macros
+#define INTERFACE_NAME_DEFAULT "wlan0"
+#define CARD_TYPE_RTL8812EU 1
+#define CARD_TYPE_RTL8812AU 2
+#define CARD_TYPE_RTL8733BU 3
+#define CARD_TYPE_DEFAULT CARD_TYPE_RTL8812EU  // Default to rtl8812eu
+
+#define TX_POWER_MIN_DEFAULT 100   // 1 dBm
+#define TX_POWER_MAX_LIMIT 3000    // 30 dBm
+#define TX_POWER_ADJUST_MIN 100    // Minimum adjustment: 100 mBm (1 dBm)
+#define TX_POWER_ADJUST_MAX 500    // Maximum adjustment: 500 mBm (5 dBm)
+
+#define ROUND_UP_TO_NEAREST_100(x) (((x) + 99) / 100 * 100)
+#define ROUND_TO_NEAREST_100(x) (((x) + 50) / 100 * 100)
+
+#define FEC_LIMIT_DEFAULT 50
+#define LOST_LIMIT_DEFAULT 5
+#define RECOVER_TIMEOUT_DEFAULT 10  // in seconds
+
+#define SET_DELAY_DEFAULT_MS 2000   // Default delay of 2000ms between TX power adjustments
+#define RX_ANT_TIMEOUT_DEFAULT 5    // Default RX_ANT timeout of 5 seconds
+
+#define MAX_BUFFER_SIZE 1024
+#define MAX_LINE_LENGTH 512
+
+#define TCP_PORT 9995
+
+// Enumerations
+typedef enum {
+    PID_CONTROL_RSSI,
+    PID_CONTROL_SNR
+} pid_control_type_t;
+
+typedef enum {
+    HYSTERESIS_STATE_LOW = -1,
+    HYSTERESIS_STATE_DEADBAND = 0,
+    HYSTERESIS_STATE_HIGH = 1
+} hysteresis_state_t;
+
+typedef enum {
+    DATA_SOURCE_STDIN,
+    DATA_SOURCE_SOCKET
+} data_source_t;
+
+// Structures
+typedef struct {
+    int verbose;
+    char interface_name[256];
+    int card_type;
+    int tx_power_min;
+    int tx_power_max;
+    int tx_power_adjust_min;
+    int tx_power_adjust_max;
+    int current_tx_power;
+
+    pid_control_type_t pid_control_type;
+    int target_value;
+
+    unsigned int fec_limit;
+    unsigned int lost_limit;
+    int recover_timeout;
+
+    int alink_enabled;
+    double hysteresis_value;
+    double deadband_lower;
+    hysteresis_state_t hysteresis_state;
+    time_t last_script_call_time;
+
+    double ema_rssi;
+    double ema_snr;
+    double ema_alpha;
+    int ema_initialized;
+
+    double integral;
+    double previous_error;
+
+    double Kp;
+    double Ki;
+    double Kd;
+
+    double error_threshold;               // Error threshold for making adjustments
+
+    uint64_t total_packets;
+    uint64_t lost_packets;
+    uint64_t unrecoverable_packets;
+
+    int pid_control_enabled;
+    int manual_mode_enabled;
+    time_t pid_paused_until;
+
+    int tcp_server_fd;
+    volatile sig_atomic_t signal_received;
+    volatile sig_atomic_t terminate;
+
+    int set_delay_ms;                // Minimum delay between TX power adjustments in milliseconds
+    struct timespec last_tx_adjust_time;  // Timestamp of the last TX power adjustment
+
+    struct timespec last_rx_ant_time;     // Timestamp of the last RX_ANT line processed
+    int rx_ant_timeout;                   // RX_ANT timeout duration in seconds
+    int rx_ant_timeout_triggered;         // Flag to indicate if the timeout action has been triggered
+
+    int in_fallback_state;                // Flag indicating if we're in fallback state
+
+    // For command-line argument parsing
+    int argc;
+    char **argv;
+
+    // Timestamps for data sources
+    struct timespec last_socket_rx_ant_time;
+    struct timespec last_stdin_rx_ant_time;
+    struct timespec last_socket_pkt_time;
+    struct timespec last_stdin_pkt_time;
+
+    // Hysteresis parameters
+    int hysteresis_offset_rssi;
+    int hysteresis_offset_snr;
+    int dead_band_half_rssi;
+    int dead_band_half_snr;
+} tx_ctrl_config_t;
+
+// Function Prototypes
+void print_help(const char *program_name);
+void initialize_config(tx_ctrl_config_t *config);
+int parse_arguments(tx_ctrl_config_t *config);
+const char* get_card_type_name(int card_type);
+void signal_handler(int sig);
+void cleanup();
+int setup_tcp_server(tx_ctrl_config_t *config);
+void close_tcp_server(tx_ctrl_config_t *config);
+void main_loop(tx_ctrl_config_t *config);
+int process_stdin_input(tx_ctrl_config_t *config);
+void process_line(tx_ctrl_config_t *config, const char *line, data_source_t source, struct timespec *timestamp);
+int adjust_tx_power(tx_ctrl_config_t *config, int tx_power);
+int calculate_pid_output(tx_ctrl_config_t *config, double current_value);
+void update_hysteresis(tx_ctrl_config_t *config, double current_value);
+void call_script(tx_ctrl_config_t *config, const char *script_name, const char *argument);
+void initialize_hysteresis(tx_ctrl_config_t *config);
+void initialize_tx_power(tx_ctrl_config_t *config);
+void print_current_settings(tx_ctrl_config_t *config);
+void process_tcp_connection(tx_ctrl_config_t *config);
+int execute_command(const char *command, char *const argv[]);
+
+// Global Configuration
+tx_ctrl_config_t config;
+
+// Main Function
+int main(int argc, char *argv[]) {
+    // Initialize configuration
+    memset(&config, 0, sizeof(tx_ctrl_config_t));
+    config.argc = argc;
+    config.argv = argv;
+    initialize_config(&config);
+
+    // Parse command-line arguments
+    if (parse_arguments(&config) != 0) {
+        return EXIT_FAILURE;
+    }
+
+    // Set up signal handlers
+    struct sigaction sa;
+    sa.sa_handler = &signal_handler;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+
+    if (sigaction(SIGUSR1, &sa, NULL) == -1 ||
+        sigaction(SIGUSR2, &sa, NULL) == -1 ||
+        sigaction(SIGINT, &sa, NULL) == -1 ||
+        sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("Error setting up signal handlers");
+        return EXIT_FAILURE;
+    }
+
+    // Register cleanup function
+    if (atexit(cleanup) != 0) {
+        fprintf(stderr, "Failed to register cleanup function.\n");
+        return EXIT_FAILURE;
+    }
+
+    // Initialize hysteresis if alink is enabled
+    if (config.alink_enabled) {
+        initialize_hysteresis(&config);
+    }
+
+    // Print current settings
+    print_current_settings(&config);
+
+    // Initialize TX power
+    initialize_tx_power(&config);
+
+    // Set up TCP server unconditionally
+    if (setup_tcp_server(&config) != 0) {
+        fprintf(stderr, "Failed to set up TCP server.\n");
+        return EXIT_FAILURE;
+    }
+
+    // Start main loop
+    main_loop(&config);
+
+    return EXIT_SUCCESS;
+}
+
+// Function Implementations
+
+/**
+ * @brief Prints the help message.
+ * @param program_name The name of the program.
+ */
+void print_help(const char *program_name) {
+    printf("Usage: %s [OPTIONS]\n", program_name);
+    printf("Options:\n");
+    printf("  --help                 Show this help message and exit\n");
+    printf("  --verbose              Enable verbose output\n");
+    printf("  --wlanid=ID            Specify the network interface name (required)\n");
+    printf("  --card-type=NAME       Specify WiFi card type:\n");
+    printf("                           'rtl8812eu'\n");
+    printf("                           'rtl8812au'\n");
+    printf("                           'rtl8733bu'\n");
+    printf("                         (default: %s)\n", get_card_type_name(CARD_TYPE_DEFAULT));
+    printf("  --tx-min=VALUE         Override minimum TX power (in mBm)\n");
+    printf("  --tx-max=VALUE         Override maximum TX power (in mBm)\n");
+    printf("                         Values must be between 100 and 3000, rounded up to nearest 100.\n");
+    printf("  --target-value=VAL     Set target RSSI/SNR value (default: -60 for RSSI, 18 for SNR)\n");
+    printf("  --pid-control=TYPE     Use 'rssi' or 'snr' for PID controller (default: rssi)\n");
+    printf("  --fec-limit=VALUE      Set FEC recovered packets limit (default: %d)\n", FEC_LIMIT_DEFAULT);
+    printf("  --lost-limit=VALUE     Set lost packets limit (default: %d)\n", LOST_LIMIT_DEFAULT);
+    printf("                         Values must be between 1 and 100.\n");
+    printf("  --recover-timeout=SEC  Set recovery timeout in seconds (default: %d)\n", RECOVER_TIMEOUT_DEFAULT);
+    printf("  --alink                Enable hysteresis logic and script execution\n");
+    printf("  --set-delay=MS         Minimum delay between TX power adjustments in milliseconds (default: %d)\n", SET_DELAY_DEFAULT_MS);
+    printf("  --rx-ant-timeout=SEC   Set RX_ANT timeout duration in seconds (default: %d)\n", RX_ANT_TIMEOUT_DEFAULT);
+    printf("  --kp=VALUE             Set proportional gain Kp for PID controller (default: %.1f)\n", 50.0);
+    printf("  --ki=VALUE             Set integral gain Ki for PID controller (default: %.1f)\n", 0.0);
+    printf("  --kd=VALUE             Set derivative gain Kd for PID controller (default: %.1f)\n", 0.0);
+    printf("  --error-threshold=VAL  Set error threshold for adjustments (default: %.1f)\n", 1.0);
+    printf("  --hysteresis-offset-rssi=VAL   Set hysteresis offset for RSSI (default: 12)\n");
+    printf("  --hysteresis-offset-snr=VAL    Set hysteresis offset for SNR (default: 6)\n");
+    printf("  --dead-band-half-rssi=VAL      Set dead band half width for RSSI (default: 6)\n");
+    printf("  --dead-band-half-snr=VAL       Set dead band half width for SNR (default: 3)\n");
+}
+
+/**
+ * @brief Initializes the configuration with default values.
+ * @param config Pointer to the configuration structure.
+ */
+void initialize_config(tx_ctrl_config_t *config) {
+    // Set default values
+    config->verbose = 0;
+    strncpy(config->interface_name, INTERFACE_NAME_DEFAULT, sizeof(config->interface_name) - 1);
+    config->card_type = CARD_TYPE_DEFAULT;
+    config->tx_power_min = TX_POWER_MIN_DEFAULT;
+    config->tx_power_max = 0; // Will be set based on card type
+    config->tx_power_adjust_min = TX_POWER_ADJUST_MIN;
+    config->tx_power_adjust_max = TX_POWER_ADJUST_MAX;
+
+    config->pid_control_type = PID_CONTROL_RSSI;
+    config->target_value = -60; // Updated default RSSI target
+
+    config->fec_limit = FEC_LIMIT_DEFAULT;
+    config->lost_limit = LOST_LIMIT_DEFAULT;
+    config->recover_timeout = RECOVER_TIMEOUT_DEFAULT;
+
+    config->alink_enabled = 0;
+    config->hysteresis_value = 0.0;
+    config->deadband_lower = 0.0;
+    config->hysteresis_state = HYSTERESIS_STATE_DEADBAND;
+    config->last_script_call_time = 0;
+
+    config->ema_rssi = 0.0;
+    config->ema_snr = 0.0;
+    config->ema_alpha = 0.2;
+    config->ema_initialized = 0;
+
+    config->integral = 0.0;
+    config->previous_error = 0.0;
+
+    config->Kp = 50.0;  // Default proportional gain
+    config->Ki = 0.0;   // Default integral gain
+    config->Kd = 0.0;   // Default derivative gain
+
+    config->error_threshold = 1.0; // Default error threshold
+
+    config->total_packets = 0;
+    config->lost_packets = 0;
+    config->unrecoverable_packets = 0;
+
+    config->pid_control_enabled = 1;
+    config->manual_mode_enabled = 0;
+    config->pid_paused_until = 0;
+
+    config->tcp_server_fd = -1;
+    config->signal_received = 0;
+    config->terminate = 0;
+
+    config->set_delay_ms = SET_DELAY_DEFAULT_MS;  // Default delay of 2000ms
+    config->last_tx_adjust_time.tv_sec = 0;
+    config->last_tx_adjust_time.tv_nsec = 0;
+
+    config->rx_ant_timeout = RX_ANT_TIMEOUT_DEFAULT; // Default RX_ANT timeout of 5 seconds
+    clock_gettime(CLOCK_MONOTONIC, &config->last_rx_ant_time);
+    config->rx_ant_timeout_triggered = 0;
+
+    config->current_tx_power = -1;  // Uninitialized
+
+    config->in_fallback_state = 0; // Not in fallback state initially
+
+    // Initialize timestamps
+    config->last_socket_rx_ant_time.tv_sec = 0;
+    config->last_socket_rx_ant_time.tv_nsec = 0;
+    config->last_stdin_rx_ant_time.tv_sec = 0;
+    config->last_stdin_rx_ant_time.tv_nsec = 0;
+    config->last_socket_pkt_time.tv_sec = 0;
+    config->last_socket_pkt_time.tv_nsec = 0;
+    config->last_stdin_pkt_time.tv_sec = 0;
+    config->last_stdin_pkt_time.tv_nsec = 0;
+
+    // Hysteresis parameters
+    config->hysteresis_offset_rssi = 12; // Default hysteresis offset for RSSI
+    config->hysteresis_offset_snr = 6;   // Default hysteresis offset for SNR
+    config->dead_band_half_rssi = 6;     // Default dead band half width for RSSI
+    config->dead_band_half_snr = 3;      // Default dead band half width for SNR
+}
+
+/**
+ * @brief Parses command-line arguments.
+ * @param config Pointer to the configuration structure.
+ * @return 0 on success, non-zero on failure.
+ */
+int parse_arguments(tx_ctrl_config_t *config) {
+    int opt;
+    int option_index = 0;
+    int wlanid_provided = 0;
+    int tx_max_set = 0;
+    char *endptr = NULL;
+
+    static struct option long_options[] = {
+        {"help",          no_argument,       0,  0 },
+        {"verbose",       no_argument,       0,  0 },
+        {"wlanid",        required_argument, 0,  0 },
+        {"card-type",     required_argument, 0,  0 },
+        {"tx-min",        required_argument, 0,  0 },
+        {"tx-max",        required_argument, 0,  0 },
+        {"target-value",  required_argument, 0,  0 },
+        {"pid-control",   required_argument, 0,  0 },
+        {"fec-limit",     required_argument, 0,  0 },
+        {"lost-limit",    required_argument, 0,  0 },
+        {"recover-timeout", required_argument, 0, 0 },
+        {"alink",         no_argument,       0,  0 },
+        {"set-delay",     required_argument, 0,  0 },
+        {"rx-ant-timeout", required_argument, 0,  0 },
+        {"kp",            required_argument, 0,  0 },
+        {"ki",            required_argument, 0,  0 },
+        {"kd",            required_argument, 0,  0 },
+        {"error-threshold", required_argument, 0, 0 },
+        {"hysteresis-offset-rssi", required_argument, 0, 0 },
+        {"hysteresis-offset-snr", required_argument, 0, 0 },
+        {"dead-band-half-rssi", required_argument, 0, 0 },
+        {"dead-band-half-snr", required_argument, 0, 0 },
+        {0, 0, 0, 0}
+    };
+
+    optind = 1; // Reset optind to 1 before parsing
+
+    while ((opt = getopt_long(config->argc, config->argv, "", long_options, &option_index)) != -1) {
+        if (opt == '?') {
+            // Unknown option
+            print_help(config->argv[0]);
+            return -1;
+        }
+
+        if (strcmp(long_options[option_index].name, "help") == 0) {
+            print_help(config->argv[0]);
+            exit(EXIT_SUCCESS);
+        } else if (strcmp(long_options[option_index].name, "verbose") == 0) {
+            config->verbose = 1;
+        } else if (strcmp(long_options[option_index].name, "wlanid") == 0) {
+            strncpy(config->interface_name, optarg, sizeof(config->interface_name) - 1);
+            wlanid_provided = 1;
+        } else if (strcmp(long_options[option_index].name, "card-type") == 0) {
+            if (strcmp(optarg, "rtl8812eu") == 0) {
+                config->card_type = CARD_TYPE_RTL8812EU;
+            } else if (strcmp(optarg, "rtl8812au") == 0) {
+                config->card_type = CARD_TYPE_RTL8812AU;
+            } else if (strcmp(optarg, "rtl8733bu") == 0) {
+                config->card_type = CARD_TYPE_RTL8733BU;
+            } else {
+                fprintf(stderr, "Invalid card-type: should be 'rtl8812eu', 'rtl8812au', or 'rtl8733bu'.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "tx-min") == 0) {
+            config->tx_power_min = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0' || config->tx_power_min < 100 || config->tx_power_min > 3000) {
+                fprintf(stderr, "Invalid tx-min value. Must be between 100 and 3000.\n");
+                return -1;
+            }
+            config->tx_power_min = ROUND_UP_TO_NEAREST_100(config->tx_power_min);
+        } else if (strcmp(long_options[option_index].name, "tx-max") == 0) {
+            config->tx_power_max = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0' || config->tx_power_max < 100 || config->tx_power_max > 3000) {
+                fprintf(stderr, "Invalid tx-max value. Must be between 100 and 3000.\n");
+                return -1;
+            }
+            config->tx_power_max = ROUND_UP_TO_NEAREST_100(config->tx_power_max);
+            tx_max_set = 1;
+        } else if (strcmp(long_options[option_index].name, "target-value") == 0) {
+            config->target_value = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid target-value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "pid-control") == 0) {
+            if (strcmp(optarg, "rssi") == 0) {
+                config->pid_control_type = PID_CONTROL_RSSI;
+            } else if (strcmp(optarg, "snr") == 0) {
+                config->pid_control_type = PID_CONTROL_SNR;
+                if (config->target_value == -60) {
+                    config->target_value = 18; // Updated default SNR target
+                }
+            } else {
+                fprintf(stderr, "Invalid pid-control type: should be 'rssi' or 'snr'.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "fec-limit") == 0) {
+            unsigned long val = strtoul(optarg, &endptr, 10);
+            if (*endptr != '\0' || val < 1 || val > 100) {
+                fprintf(stderr, "Invalid fec-limit. Must be between 1 and 100.\n");
+                return -1;
+            }
+            config->fec_limit = (unsigned int)val;
+        } else if (strcmp(long_options[option_index].name, "lost-limit") == 0) {
+            unsigned long val = strtoul(optarg, &endptr, 10);
+            if (*endptr != '\0' || val < 1 || val > 100) {
+                fprintf(stderr, "Invalid lost-limit. Must be between 1 and 100.\n");
+                return -1;
+            }
+            config->lost_limit = (unsigned int)val;
+        } else if (strcmp(long_options[option_index].name, "recover-timeout") == 0) {
+            config->recover_timeout = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0' || config->recover_timeout < 1) {
+                fprintf(stderr, "Invalid recover-timeout. Must be greater than 0.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "alink") == 0) {
+            config->alink_enabled = 1;
+        } else if (strcmp(long_options[option_index].name, "set-delay") == 0) {
+            config->set_delay_ms = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0' || config->set_delay_ms < 0) {
+                fprintf(stderr, "Invalid set-delay. Must be a non-negative integer.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "rx-ant-timeout") == 0) {
+            config->rx_ant_timeout = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0' || config->rx_ant_timeout < 1) {
+                fprintf(stderr, "Invalid rx-ant-timeout. Must be greater than 0.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "kp") == 0) {
+            config->Kp = strtod(optarg, &endptr);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid Kp value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "ki") == 0) {
+            config->Ki = strtod(optarg, &endptr);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid Ki value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "kd") == 0) {
+            config->Kd = strtod(optarg, &endptr);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid Kd value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "error-threshold") == 0) {
+            config->error_threshold = strtod(optarg, &endptr);
+            if (*endptr != '\0' || config->error_threshold <= 0.0) {
+                fprintf(stderr, "Invalid error-threshold value. Must be greater than 0.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "hysteresis-offset-rssi") == 0) {
+            config->hysteresis_offset_rssi = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid hysteresis-offset-rssi value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "hysteresis-offset-snr") == 0) {
+            config->hysteresis_offset_snr = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid hysteresis-offset-snr value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "dead-band-half-rssi") == 0) {
+            config->dead_band_half_rssi = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid dead-band-half-rssi value.\n");
+                return -1;
+            }
+        } else if (strcmp(long_options[option_index].name, "dead-band-half-snr") == 0) {
+            config->dead_band_half_snr = (int)strtol(optarg, &endptr, 10);
+            if (*endptr != '\0') {
+                fprintf(stderr, "Invalid dead-band-half-snr value.\n");
+                return -1;
+            }
+        }
+    }
+
+    if (!wlanid_provided) {
+        fprintf(stderr, "Error: --wlanid option is required.\n");
+        print_help(config->argv[0]);
+        return -1;
+    }
+
+    // Set default tx_power_max based on card_type if not overridden
+    if (!tx_max_set) {
+        if (config->card_type == CARD_TYPE_RTL8812AU) {
+            config->tx_power_max = 2000;  // 20 dBm
+        } else if (config->card_type == CARD_TYPE_RTL8812EU) {
+            config->tx_power_max = 2800;  // 28 dBm
+        } else if (config->card_type == CARD_TYPE_RTL8733BU) {
+            config->tx_power_max = 2000;  // 20 dBm
+        }
+    }
+
+    // Ensure MIN is less than MAX
+    if (config->tx_power_min > config->tx_power_max) {
+        fprintf(stderr, "Error: tx-min (%d) must be less than or equal to tx-max (%d).\n",
+                config->tx_power_min, config->tx_power_max);
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Returns the card type name.
+ * @param card_type The card type enum value.
+ * @return The card type name as a string.
+ */
+const char* get_card_type_name(int card_type) {
+    switch (card_type) {
+        case CARD_TYPE_RTL8812EU:
+            return "rtl8812eu";
+        case CARD_TYPE_RTL8812AU:
+            return "rtl8812au";
+        case CARD_TYPE_RTL8733BU:
+            return "rtl8733bu";
+        default:
+            return "Unknown";
+    }
+}
+
+/**
+ * @brief Signal handler for various signals.
+ * @param sig The signal number received.
+ */
+void signal_handler(int sig) {
+    if (sig == SIGUSR1) {
+        config.signal_received = SIGUSR1;
+    } else if (sig == SIGUSR2) {
+        config.signal_received = SIGUSR2;
+    } else if (sig == SIGINT || sig == SIGTERM) {
+        config.terminate = 1;
+    }
+}
+
+/**
+ * @brief Cleanup function called upon program exit.
+ */
+void cleanup() {
+    if (config.tcp_server_fd != -1) {
+        close_tcp_server(&config);
+    }
+}
+
+/**
+ * @brief Sets up the TCP server.
+ * @param config Pointer to the configuration structure.
+ * @return 0 on success, -1 on failure.
+ */
+int setup_tcp_server(tx_ctrl_config_t *config) {
+    struct sockaddr_in server_addr;
+    int opt = 1;
+
+    // Create socket file descriptor
+    if ((config->tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        perror("socket failed");
+        config->tcp_server_fd = -1;
+        return -1;
+    }
+
+    // Set socket options
+    if (setsockopt(config->tcp_server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) == -1) {
+        perror("setsockopt");
+        close_tcp_server(config);
+        return -1;
+    }
+
+    // Set socket to non-blocking mode
+    if (fcntl(config->tcp_server_fd, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        close_tcp_server(config);
+        return -1;
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(TCP_PORT);
+
+    // Bind the socket to the port
+    if (bind(config->tcp_server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+        perror("bind failed");
+        close_tcp_server(config);
+        return -1;
+    }
+
+    if (listen(config->tcp_server_fd, 5) == -1) {
+        perror("listen");
+        close_tcp_server(config);
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Closes the TCP server socket.
+ * @param config Pointer to the configuration structure.
+ */
+void close_tcp_server(tx_ctrl_config_t *config) {
+    if (config->tcp_server_fd != -1) {
+        close(config->tcp_server_fd);
+        config->tcp_server_fd = -1;
+    }
+}
+
+/**
+ * @brief The main loop of the program.
+ * @param config Pointer to the configuration structure.
+ */
+void main_loop(tx_ctrl_config_t *config) {
+    fd_set read_fds;
+    int max_fd;
+    struct timespec timeout;
+    int select_ret;
+
+    while (!config->terminate) {
+        // Handle signals
+        if (config->signal_received == SIGUSR1) {
+            config->pid_control_enabled = 1;
+            config->pid_paused_until = 0;
+            config->manual_mode_enabled = 0;
+            if (config->verbose) {
+                printf("PID control enabled via SIGUSR1\n");
+            }
+            config->signal_received = 0;
+        } else if (config->signal_received == SIGUSR2) {
+            config->manual_mode_enabled = 1;
+            config->pid_control_enabled = 0;
+            config->pid_paused_until = 0;
+            if (config->verbose) {
+                printf("Manual mode enabled via SIGUSR2.\n");
+            }
+            config->signal_received = 0;
+        }
+
+        // Check if PID control needs to be resumed
+        if (!config->pid_control_enabled && config->pid_paused_until > 0) {
+            struct timespec current_time;
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            if (current_time.tv_sec >= config->pid_paused_until) {
+                config->pid_control_enabled = 1;
+                config->pid_paused_until = 0;
+                // Note: Do not reset in_fallback_state here
+                // Reset PID controller variables if needed
+                config->integral = 0.0;
+                config->previous_error = 0.0;
+                if (config->verbose) {
+                    printf("PID control resumed after recovery timeout.\n");
+                }
+
+                // Re-evaluate hysteresis state and call scripts if necessary
+                if (config->ema_initialized && config->alink_enabled) {
+                    double current_value = (config->pid_control_type == PID_CONTROL_RSSI) ? config->ema_rssi : config->ema_snr;
+                    update_hysteresis(config, current_value);
+                }
+            }
+        }
+
+        FD_ZERO(&read_fds);
+
+        // Add stdin to the set
+        FD_SET(STDIN_FILENO, &read_fds);
+        max_fd = STDIN_FILENO;
+
+        // Add tcp_server_fd to the set
+        if (config->tcp_server_fd != -1) {
+            FD_SET(config->tcp_server_fd, &read_fds);
+            if (config->tcp_server_fd > max_fd) {
+                max_fd = config->tcp_server_fd;
+            }
+        }
+
+        // Set timeout for select()
+        timeout.tv_sec = 1;
+        timeout.tv_nsec = 0;
+
+        select_ret = pselect(max_fd + 1, &read_fds, NULL, NULL, &timeout, NULL);
+
+        if (select_ret == -1) {
+            if (errno != EINTR) {
+                perror("select error");
+                break;
+            }
+        } else if (select_ret > 0) {
+            // Check if data is available on stdin
+            if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+                // Read from stdin
+                if (!process_stdin_input(config)) {
+                    // EOF or error
+                    break;
+                }
+            }
+
+            // Check if data is available on TCP socket
+            if (config->tcp_server_fd != -1 && FD_ISSET(config->tcp_server_fd, &read_fds)) {
+                // Accept new connection and process data
+                process_tcp_connection(config);
+            }
+        }
+
+        // Check if RX_ANT timeout has been exceeded
+        struct timespec current_time;
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+
+        double elapsed_time = (current_time.tv_sec - config->last_rx_ant_time.tv_sec) +
+                              (current_time.tv_nsec - config->last_rx_ant_time.tv_nsec) / 1e9;
+
+        if (elapsed_time >= config->rx_ant_timeout && !config->rx_ant_timeout_triggered &&
+            config->pid_control_enabled && !config->manual_mode_enabled) {
+            // RX_ANT timeout exceeded, take action
+            adjust_tx_power(config, config->tx_power_max);
+            config->pid_control_enabled = 0;
+            config->pid_paused_until = current_time.tv_sec + config->recover_timeout;
+            config->rx_ant_timeout_triggered = 1; // Set the flag to prevent repeated triggers
+            config->in_fallback_state = 1; // Enter fallback state
+
+            if (config->verbose) {
+                printf("No RX_ANT stats received for %.1f seconds. TX power set to max and PID control paused for %d seconds.\n",
+                       elapsed_time, config->recover_timeout);
+            }
+
+            // Call fallback script
+            if (config->alink_enabled) {
+                call_script(config, "tx_fallback.sh", "");
+            }
+        }
+
+        // Perform periodic tasks here if needed
+    }
+
+    // After processing all input, print summary
+    if (config->verbose) {
+        printf("Summary Statistics:\n");
+        printf("  Total Packets: %" PRIu64 "\n", config->total_packets);
+        printf("  Lost Packets: %" PRIu64 "\n", config->lost_packets);
+        printf("  Unrecoverable Packets: %" PRIu64 "\n", config->unrecoverable_packets);
+    }
+}
+
+/**
+ * @brief Processes input from stdin.
+ * @param config Pointer to the configuration structure.
+ * @return 1 to continue, 0 to stop.
+ */
+int process_stdin_input(tx_ctrl_config_t *config) {
+    char line[MAX_LINE_LENGTH];
+    struct timespec timestamp;
+
+    if (fgets(line, sizeof(line), stdin) != NULL) {
+        clock_gettime(CLOCK_MONOTONIC, &timestamp);
+        process_line(config, line, DATA_SOURCE_STDIN, &timestamp);
+        return 1;
+    } else {
+        if (feof(stdin)) {
+            // EOF
+            return 0;
+        } else {
+            perror("fgets");
+            return 0;
+        }
+    }
+}
+
+/**
+ * @brief Processes a single line of input.
+ * @param config Pointer to the configuration structure.
+ * @param line The line of input to process.
+ * @param source The data source (stdin or socket).
+ * @param timestamp The timestamp when the data was received.
+ */
+void process_line(tx_ctrl_config_t *config, const char *line, data_source_t source, struct timespec *timestamp) {
+    uint64_t data_timestamp;
+    char type[16];
+    char *line_copy = strdup(line);
+    char *token = NULL;
+    char *saveptr = NULL;
+
+    if (!line_copy) {
+        fprintf(stderr, "Memory allocation error.\n");
+        return;
+    }
+
+    // Remove newline character
+    line_copy[strcspn(line_copy, "\r\n")] = '\0';
+
+    // Tokenize the line
+    token = strtok_r(line_copy, "\t ", &saveptr);
+    if (token == NULL) {
+        free(line_copy);
+        return;
+    }
+
+    // Parse data timestamp
+    char *endptr = NULL;
+    data_timestamp = strtoull(token, &endptr, 10);
+    if (*endptr != '\0') {
+        if (config->verbose) {
+            printf("Invalid timestamp in line: %s\n", line);
+        }
+        free(line_copy);
+        return;
+    }
+
+    // Check if data is too old (only for stdin data)
+    if (source == DATA_SOURCE_STDIN) {
+        struct timespec current_time;
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+        double elapsed_ms = (current_time.tv_sec - timestamp->tv_sec) * 1000 +
+                            (current_time.tv_nsec - timestamp->tv_nsec) / 1e6;
+        if (elapsed_ms > 2000.0) {
+            if (config->verbose) {
+                printf("Discarding old stdin data (%.2f ms old): %s\n", elapsed_ms, line);
+            }
+            free(line_copy);
+            return;
+        }
+    }
+
+    // Parse type
+    token = strtok_r(NULL, "\t ", &saveptr);
+    if (token == NULL) {
+        free(line_copy);
+        return;
+    }
+    strncpy(type, token, sizeof(type) - 1);
+    type[sizeof(type) - 1] = '\0'; // Ensure null-termination
+
+    // Handle different types
+    if (strcmp(type, "RX_ANT") == 0) {
+        // Handle RX_ANT line
+        char *freq_info = strtok_r(NULL, "\t ", &saveptr);
+        char *antenna_id_str = strtok_r(NULL, "\t ", &saveptr);
+        char *stats = strtok_r(NULL, "\t ", &saveptr);
+
+        if (freq_info && antenna_id_str && stats) {
+            int antenna_id = (int)strtol(antenna_id_str, &endptr, 10);
+            if (*endptr != '\0') {
+                if (config->verbose) {
+                    printf("Invalid antenna ID in line: %s\n", line);
+                }
+                free(line_copy);
+                return;
+            }
+
+            int count_all, rssi_min, rssi_avg, rssi_max, snr_min, snr_avg, snr_max;
+            if (sscanf(stats, "%d:%d:%d:%d:%d:%d:%d",
+                       &count_all, &rssi_min, &rssi_avg, &rssi_max,
+                       &snr_min, &snr_avg, &snr_max) == 7) {
+
+                // Update Exponential Moving Average
+                if (!config->ema_initialized) {
+                    config->ema_rssi = rssi_avg;
+                    config->ema_snr = snr_avg;
+                    config->ema_initialized = 1;
+                } else {
+                    config->ema_rssi = config->ema_alpha * rssi_avg + (1 - config->ema_alpha) * config->ema_rssi;
+                    config->ema_snr = config->ema_alpha * snr_avg + (1 - config->ema_alpha) * config->ema_snr;
+                }
+
+                if (config->verbose) {
+                    printf("-------------------------\n");
+                    printf("Timestamp: %" PRIu64 "\n", data_timestamp);
+                    printf("Antenna ID: %d\n", antenna_id);
+                    printf("EMA RSSI: %.2f dBm\n", config->ema_rssi);
+                    printf("EMA SNR: %.2f dB\n", config->ema_snr);
+                }
+
+                // Update last_rx_ant_time
+                clock_gettime(CLOCK_MONOTONIC, &config->last_rx_ant_time);
+                config->rx_ant_timeout_triggered = 0; // Reset the timeout trigger flag
+
+                // Update last data time for source
+                if (source == DATA_SOURCE_SOCKET) {
+                    config->last_socket_rx_ant_time = *timestamp;
+                } else {
+                    config->last_stdin_rx_ant_time = *timestamp;
+                }
+
+                // Determine whether to use this data for PID control
+                int use_data = 0;
+
+                if (source == DATA_SOURCE_SOCKET) {
+                    use_data = 1;
+                } else {
+                    // Check if no socket data has arrived in the last 1000ms
+                    struct timespec current_time;
+                    clock_gettime(CLOCK_MONOTONIC, &current_time);
+                    double elapsed_ms = (current_time.tv_sec - config->last_socket_rx_ant_time.tv_sec) * 1000 +
+                                        (current_time.tv_nsec - config->last_socket_rx_ant_time.tv_nsec) / 1e6;
+                    if (elapsed_ms > 1000.0) {
+                        use_data = 1;
+                    } else {
+                        if (config->verbose) {
+                            printf("Ignoring stdin RX_ANT data due to recent socket data (%.2f ms ago).\n", elapsed_ms);
+                        }
+                    }
+                }
+
+                // Update hysteresis logic regardless of PID control state
+                if (config->alink_enabled) {
+                    double current_value = (config->pid_control_type == PID_CONTROL_RSSI) ? config->ema_rssi : config->ema_snr;
+                    update_hysteresis(config, current_value);
+                }
+
+                if (use_data) {
+                    // Adjust TX power if PID control is enabled
+                    if (config->pid_control_enabled && config->ema_initialized && !config->manual_mode_enabled) {
+                        double current_value = (config->pid_control_type == PID_CONTROL_RSSI) ? config->ema_rssi : config->ema_snr;
+                        int tx_power = calculate_pid_output(config, current_value);
+
+                        // Ensure tx_power is within min and max
+                        if (tx_power < config->tx_power_min) {
+                            tx_power = config->tx_power_min;
+                        }
+                        if (tx_power > config->tx_power_max) {
+                            tx_power = config->tx_power_max;
+                        }
+
+                        // Adjust TX power
+                        adjust_tx_power(config, tx_power);
+                    } else if (!config->pid_control_enabled && !config->manual_mode_enabled) {
+                        // If PID control is disabled and not in manual mode, maintain TX power at max
+                        adjust_tx_power(config, config->tx_power_max);
+                    }
+                }
+
+            } else {
+                if (config->verbose) {
+                    fprintf(stderr, "Failed to parse RX_ANT stats in line: %s\n", line);
+                }
+            }
+        } else {
+            if (config->verbose) {
+                fprintf(stderr, "Failed to parse RX_ANT line: %s\n", line);
+            }
+        }
+    } else if (strcmp(type, "PKT") == 0) {
+        // Handle PKT line
+        char *pkt_stats = strtok_r(NULL, "\t ", &saveptr);
+        if (pkt_stats) {
+            unsigned int count_p_all, count_b_all, count_p_dec_err, count_p_dec_ok;
+            unsigned int count_p_fec_recovered, count_p_lost, count_p_bad;
+            unsigned int count_p_outgoing, count_b_outgoing;
+
+            if (sscanf(pkt_stats, "%u:%u:%u:%u:%u:%u:%u:%u:%u",
+                       &count_p_all, &count_b_all, &count_p_dec_err, &count_p_dec_ok,
+                       &count_p_fec_recovered, &count_p_lost, &count_p_bad,
+                       &count_p_outgoing, &count_b_outgoing) == 9) {
+
+                // Update total counts
+                config->total_packets += count_p_all;
+                config->lost_packets += count_p_lost;
+                config->unrecoverable_packets += count_p_bad;
+
+                // Update last data time for source
+                if (source == DATA_SOURCE_SOCKET) {
+                    config->last_socket_pkt_time = *timestamp;
+                } else {
+                    config->last_stdin_pkt_time = *timestamp;
+                }
+
+                int use_data = 0;
+
+                if (source == DATA_SOURCE_SOCKET) {
+                    use_data = 1;
+                } else {
+                    // Check if no socket data has arrived in the last 1000ms
+                    struct timespec current_time;
+                    clock_gettime(CLOCK_MONOTONIC, &current_time);
+                    double elapsed_ms = (current_time.tv_sec - config->last_socket_pkt_time.tv_sec) * 1000 +
+                                        (current_time.tv_nsec - config->last_socket_pkt_time.tv_nsec) / 1e6;
+                    if (elapsed_ms > 1000.0) {
+                        use_data = 1;
+                    } else {
+                        if (config->verbose) {
+                            printf("Ignoring stdin PKT data due to recent socket data (%.2f ms ago).\n", elapsed_ms);
+                        }
+                    }
+                }
+
+                if (config->verbose) {
+                    printf("Timestamp: %" PRIu64 "\n", data_timestamp);
+                    printf("Packet Stats:\n");
+                    printf("  Total Packets: %u\n", count_p_all);
+                    printf("  FEC Recovered: %u\n", count_p_fec_recovered);
+                    printf("  Packets Lost: %u\n", count_p_lost);
+                    printf("  Unrecoverable Packets: %u\n", count_p_bad);
+                    printf("-------------------------\n");
+                }
+
+                if (use_data) {
+                    // Check for limits
+                    if ((count_p_fec_recovered > config->fec_limit || count_p_lost > config->lost_limit) && !config->manual_mode_enabled) {
+                        // Set tx power to maximum and pause PID controller
+                        adjust_tx_power(config, config->tx_power_max);
+                        config->pid_control_enabled = 0;
+                        config->in_fallback_state = 1; // Enter fallback state
+                        struct timespec current_time;
+                        clock_gettime(CLOCK_MONOTONIC, &current_time);
+                        config->pid_paused_until = current_time.tv_sec + config->recover_timeout;
+                        if (config->verbose) {
+                            printf("High FEC recovered (%u) or lost packets (%u) detected. TX power set to max and PID control paused for %d seconds.\n",
+                                   count_p_fec_recovered, count_p_lost, config->recover_timeout);
+                        }
+                        // Call fallback script
+                        if (config->alink_enabled) {
+                            call_script(config, "tx_fallback.sh", "");
+                        }
+                    }
+                }
+
+            } else {
+                if (config->verbose) {
+                    fprintf(stderr, "Failed to parse PKT stats in line: %s\n", line);
+                }
+            }
+        } else {
+            if (config->verbose) {
+                fprintf(stderr, "Failed to parse PKT line: %s\n", line);
+            }
+        }
+    } else {
+        // Unknown or unhandled type
+        if (config->verbose) {
+            printf("Unknown line type '%s' in line: %s\n", type, line);
+        }
+    }
+
+    free(line_copy);
+}
+
+/**
+ * @brief Adjusts the TX power.
+ * @param config Pointer to the configuration structure.
+ * @param tx_power The TX power to set in mBm.
+ * @return 0 on success, -1 on failure.
+ */
+int adjust_tx_power(tx_ctrl_config_t *config, int tx_power) {
+    int ret;
+
+    // Check if TX power has changed
+    if (tx_power == config->current_tx_power) {
+        if (config->verbose) {
+            printf("TX power remains the same (%d mBm). No adjustment needed.\n", tx_power);
+        }
+        return 0;
+    }
+
+    // Enforce minimum delay between adjustments
+    struct timespec current_time;
+    clock_gettime(CLOCK_MONOTONIC, &current_time);
+
+    long elapsed_ms = (current_time.tv_sec - config->last_tx_adjust_time.tv_sec) * 1000 +
+                      (current_time.tv_nsec - config->last_tx_adjust_time.tv_nsec) / 1000000;
+
+    if (elapsed_ms < config->set_delay_ms) {
+        if (config->verbose) {
+            printf("Minimum delay between TX adjustments not met (%ld ms elapsed, %d ms required). Skipping adjustment.\n",
+                   elapsed_ms, config->set_delay_ms);
+        }
+        return 0;
+    }
+
+    // Proceed to adjust TX power
+    char *args[8];
+    char tx_power_str[16];
+
+    // Adjust tx_power sign for rtl8812au
+    int adjusted_tx_power = tx_power;
+    if (config->card_type == CARD_TYPE_RTL8812AU) {
+        adjusted_tx_power = -tx_power;
+    }
+
+    snprintf(tx_power_str, sizeof(tx_power_str), "%d", adjusted_tx_power);
+
+    args[0] = "iw";
+    args[1] = "dev";
+    args[2] = config->interface_name;
+    args[3] = "set";
+    args[4] = "txpower";
+    args[5] = "fixed";
+    args[6] = tx_power_str;
+    args[7] = NULL;
+
+    if (config->verbose) {
+        printf("Adjusting TX power from %d mBm to %d mBm\n", config->current_tx_power, tx_power);
+    }
+
+    ret = execute_command("iw", args);
+
+    if (ret != 0) {
+        fprintf(stderr, "Failed to set TX power.\n");
+        return -1;
+    }
+
+    // Update current TX power and timestamp
+    config->current_tx_power = tx_power;
+    config->last_tx_adjust_time = current_time;
+
+    return 0;
+}
+
+/**
+ * @brief Executes a command using execvp.
+ * @param command The command to execute.
+ * @param argv The argument vector.
+ * @return The exit status of the command.
+ */
+int execute_command(const char *command, char *const argv[]) {
+    pid_t pid;
+    int status;
+
+    if (config.verbose) {
+        printf("Executing command: %s\n", command);
+        for (int i = 0; argv[i] != NULL; i++) {
+            printf(" arg[%d]: %s\n", i, argv[i]);
+        }
+    }
+
+    pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return -1;
+    } else if (pid == 0) {
+        // Child process
+        execvp(command, argv);
+        // If execvp returns, an error occurred
+        perror("execvp");
+        _exit(EXIT_FAILURE);
+    } else {
+        // Parent process
+        do {
+            if (waitpid(pid, &status, 0) == -1) {
+                if (errno != EINTR) {
+                    perror("waitpid");
+                    return -1;
+                }
+            } else {
+                break;
+            }
+        } while (1);
+
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status);
+        } else {
+            return -1;
+        }
+    }
+}
+
+/**
+ * @brief Calculates the PID controller output.
+ * @param config Pointer to the configuration structure.
+ * @param current_value The current RSSI or SNR value.
+ * @return The new TX power value.
+ */
+int calculate_pid_output(tx_ctrl_config_t *config, double current_value) {
+    double error = config->target_value - current_value;
+    config->integral += error;
+    double derivative = error - config->previous_error;
+    config->previous_error = error;
+
+    // Calculate PID output
+    double output = config->Kp * error + config->Ki * config->integral + config->Kd * derivative;
+
+    // Map the PID output to an adjustment in tx_power
+    int tx_power_change = (int)(output);
+
+    // Limit tx_power_change to allowed maximum
+    if (tx_power_change > config->tx_power_adjust_max) {
+        tx_power_change = config->tx_power_adjust_max;
+    } else if (tx_power_change < -config->tx_power_adjust_max) {
+        tx_power_change = -config->tx_power_adjust_max;
+    }
+
+    // Round tx_power_change to nearest 100 mBm
+    tx_power_change = ROUND_TO_NEAREST_100(tx_power_change);
+
+    // Ensure tx_power_change is at least tx_power_adjust_min when error is significant
+    if (fabs(error) >= config->error_threshold) {
+        if (tx_power_change > 0 && tx_power_change < config->tx_power_adjust_min) {
+            tx_power_change = config->tx_power_adjust_min;
+        } else if (tx_power_change < 0 && tx_power_change > -config->tx_power_adjust_min) {
+            tx_power_change = -config->tx_power_adjust_min;
+        }
+    } else {
+        tx_power_change = 0;
+    }
+
+    // Calculate the new tx_power by adding the change
+    int tx_power = config->current_tx_power + tx_power_change;
+
+    // Ensure tx_power is within tx_power_min and tx_power_max
+    if (tx_power > config->tx_power_max) tx_power = config->tx_power_max;
+    if (tx_power < config->tx_power_min) tx_power = config->tx_power_min;
+
+    return tx_power;
+}
+
+/**
+ * @brief Updates the hysteresis state and executes scripts if necessary.
+ * @param config Pointer to the configuration structure.
+ * @param current_value The current RSSI or SNR value.
+ */
+void update_hysteresis(tx_ctrl_config_t *config, double current_value) {
+    hysteresis_state_t previous_state = config->hysteresis_state;
+
+    // Determine the new hysteresis state based on current value
+    if (current_value > config->hysteresis_value) {
+        config->hysteresis_state = HYSTERESIS_STATE_HIGH;
+    } else if (current_value <= config->hysteresis_value && current_value >= config->deadband_lower) {
+        config->hysteresis_state = HYSTERESIS_STATE_DEADBAND;
+    } else {
+        config->hysteresis_state = HYSTERESIS_STATE_LOW;
+    }
+
+    if (config->in_fallback_state) {
+        // Transitioning from fallback state to any other state
+        config->in_fallback_state = 0; // Reset fallback state flag
+
+        // Call the appropriate script with "up" argument
+        if (config->hysteresis_state == HYSTERESIS_STATE_HIGH) {
+            call_script(config, "tx_high_signal.sh", "up");
+        } else {
+            call_script(config, "tx_low_signal.sh", "up");
+        }
+    } else if (previous_state != config->hysteresis_state) {
+        // Normal hysteresis logic
+        if (config->hysteresis_state == HYSTERESIS_STATE_HIGH && previous_state != HYSTERESIS_STATE_HIGH) {
+            // Moving to high signal past hysteresis point
+            call_script(config, "tx_high_signal.sh", "up");
+        } else if (config->hysteresis_state == HYSTERESIS_STATE_LOW && previous_state != HYSTERESIS_STATE_LOW) {
+            // Moving to low signal past hysteresis point
+            call_script(config, "tx_low_signal.sh", "down");
+        }
+    }
+}
+
+/**
+ * @brief Calls an external script with the given argument.
+ * @param config Pointer to the configuration structure.
+ * @param script_name The script to execute.
+ * @param argument The argument to pass to the script.
+ */
+void call_script(tx_ctrl_config_t *config, const char *script_name, const char *argument) {
+    struct timespec current_time;
+    clock_gettime(CLOCK_MONOTONIC, &current_time);
+
+    // Enforce timeout between script calls
+    if (current_time.tv_sec - config->last_script_call_time >= config->recover_timeout) {
+        if (config->verbose) {
+            printf("Executing script: %s %s\n", script_name, argument);
+        }
+        pid_t pid = fork();
+        if (pid == -1) {
+            perror("fork");
+            return;
+        } else if (pid == 0) {
+            // Child process
+            execlp(script_name, script_name, argument, (char *)NULL);
+            // If execlp returns, an error occurred
+            perror("execlp");
+            _exit(EXIT_FAILURE);
+        } else {
+            // Parent process
+            int status;
+            waitpid(pid, &status, 0);
+            config->last_script_call_time = current_time.tv_sec;
+            if (config->verbose) {
+                printf("Executed script: %s %s\n", script_name, argument);
+            }
+        }
+    } else {
+        if (config->verbose) {
+            printf("Script call suppressed due to timeout (%d seconds).\n", config->recover_timeout);
+        }
+    }
+}
+
+/**
+ * @brief Initializes hysteresis parameters.
+ * @param config Pointer to the configuration structure.
+ */
+void initialize_hysteresis(tx_ctrl_config_t *config) {
+    if (config->pid_control_type == PID_CONTROL_RSSI) {
+        config->hysteresis_value = config->target_value - config->hysteresis_offset_rssi;
+        config->deadband_lower = config->hysteresis_value - config->dead_band_half_rssi;
+    } else {
+        config->hysteresis_value = config->target_value - config->hysteresis_offset_snr;
+        config->deadband_lower = config->hysteresis_value - config->dead_band_half_snr;
+    }
+    config->hysteresis_state = HYSTERESIS_STATE_DEADBAND;
+    config->last_script_call_time = 0;
+    if (config->verbose) {
+        printf("Hysteresis initialized. Hysteresis value: %.2f, Deadband lower limit: %.2f\n",
+               config->hysteresis_value, config->deadband_lower);
+    }
+}
+
+/**
+ * @brief Initializes the TX power to minimum at startup.
+ * @param config Pointer to the configuration structure.
+ */
+void initialize_tx_power(tx_ctrl_config_t *config) {
+    if (adjust_tx_power(config, config->tx_power_min) == 0) {
+        config->current_tx_power = config->tx_power_min;
+        if (config->verbose) {
+            printf("Initial TX power set to MIN: %d mBm\n", config->tx_power_min);
+        }
+    } else {
+        fprintf(stderr, "Failed to set initial TX power.\n");
+    }
+}
+
+/**
+ * @brief Prints the current settings.
+ * @param config Pointer to the configuration structure.
+ */
+void print_current_settings(tx_ctrl_config_t *config) {
+    printf("Current Settings:\n");
+    printf("  Verbose mode: %s\n", config->verbose ? "Enabled" : "Disabled");
+    printf("  Interface name: %s\n", config->interface_name);
+    printf("  Card type: %s\n", get_card_type_name(config->card_type));
+    printf("  TX Power Min: %d mBm\n", config->tx_power_min);
+    printf("  TX Power Max: %d mBm\n", config->tx_power_max);
+    printf("  Target Value: %d %s\n", config->target_value,
+           config->pid_control_type == PID_CONTROL_RSSI ? "dBm (RSSI)" : "dB (SNR)");
+    printf("  PID Control using: %s\n", config->pid_control_type == PID_CONTROL_RSSI ? "RSSI" : "SNR");
+    printf("  PID Control enabled: %s\n", config->pid_control_enabled ? "Yes" : "No");
+    printf("  PID Parameters: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", config->Kp, config->Ki, config->Kd);
+    printf("  Error Threshold: %.2f\n", config->error_threshold);
+    printf("  FEC Limit: %u\n", config->fec_limit);
+    printf("  Lost Limit: %u\n", config->lost_limit);
+    printf("  Recover Timeout: %d seconds\n", config->recover_timeout);
+    printf("  A-Link Enabled: %s\n", config->alink_enabled ? "Yes" : "No");
+    printf("  Set Delay: %d ms\n", config->set_delay_ms);
+    printf("  RX_ANT Timeout: %d seconds\n", config->rx_ant_timeout);
+    if (config->alink_enabled) {
+        printf("  Hysteresis Offset RSSI: %d\n", config->hysteresis_offset_rssi);
+        printf("  Hysteresis Offset SNR: %d\n", config->hysteresis_offset_snr);
+        printf("  Dead Band Half RSSI: %d\n", config->dead_band_half_rssi);
+        printf("  Dead Band Half SNR: %d\n", config->dead_band_half_snr);
+        printf("  Hysteresis Value: %.2f\n", config->hysteresis_value);
+        printf("  Deadband Lower Limit: %.2f\n", config->deadband_lower);
+    }
+    printf("-------------------------\n");
+}
+
+/**
+ * @brief Processes incoming TCP connections.
+ * @param config Pointer to the configuration structure.
+ */
+void process_tcp_connection(tx_ctrl_config_t *config) {
+    int new_socket;
+    struct sockaddr_in address;
+    socklen_t addrlen = sizeof(address);
+    char buffer[MAX_BUFFER_SIZE] = {0};
+    int valread;
+
+    // Accept the connection
+    new_socket = accept(config->tcp_server_fd, (struct sockaddr *)&address, &addrlen);
+    if (new_socket == -1) {
+        if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            perror("accept");
+        }
+        return;
+    }
+
+    // Set the new socket to non-blocking mode
+    fcntl(new_socket, F_SETFL, O_NONBLOCK);
+
+    // Read data from the new socket
+    valread = recv(new_socket, buffer, sizeof(buffer) - 1, 0);
+    if (valread == -1) {
+        if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            perror("recv");
+            close(new_socket);
+        }
+        return;
+    } else if (valread == 0) {
+        // Connection closed
+        close(new_socket);
+        return;
+    }
+
+    buffer[valread] = '\0'; // Null-terminate
+
+    // Process the data
+    char response[2048];
+
+    // Trim leading and trailing whitespace
+    char *command_str = buffer;
+    while (isspace((unsigned char)*command_str)) command_str++;
+    char *end = command_str + strlen(command_str) - 1;
+    while (end > command_str && isspace((unsigned char)*end)) end--;
+    *(end + 1) = '\0';
+
+    // Command parsing
+    if (strcasecmp(command_str, "help") == 0) {
+        // Send help information
+        snprintf(response, sizeof(response),
+            "Available Commands:\n"
+            "  help                         : Show this help message.\n"
+            "  run command <cmd>            : Execute a system command.\n"
+            "  set target rssi <value>      : Set target RSSI value.\n"
+            "  set target snr <value>       : Set target SNR value.\n"
+            "  set pid rssi                 : Use RSSI for PID control.\n"
+            "  set pid snr                  : Use SNR for PID control.\n"
+            "  set kp <value>               : Set Kp for PID controller.\n"
+            "  set ki <value>               : Set Ki for PID controller.\n"
+            "  set kd <value>               : Set Kd for PID controller.\n"
+            "  set error-threshold <value>  : Set error threshold.\n"
+            "  set hysteresis-offset-rssi <value> : Set hysteresis offset for RSSI.\n"
+            "  set hysteresis-offset-snr <value>  : Set hysteresis offset for SNR.\n"
+            "  set dead-band-half-rssi <value>    : Set dead band half width for RSSI.\n"
+            "  set dead-band-half-snr <value>     : Set dead band half width for SNR.\n"
+            "  set fec-limit <value>        : Set FEC limit.\n"
+            "  set lost-limit <value>       : Set lost packet limit.\n"
+            "  set recover-timeout <sec>    : Set recovery timeout.\n"
+            "  set set-delay <ms>           : Set delay between TX adjustments.\n"
+            "  set rx-ant-timeout <sec>     : Set RX_ANT timeout.\n"
+            "  set alink on|off             : Enable or disable A-Link.\n"
+            "  set mode manual              : Switch to manual mode.\n"
+            "  set mode pid                 : Switch to PID control mode.\n"
+            "  set tx-min <value>           : Set minimum TX power.\n"
+            "  set tx-max <value>           : Set maximum TX power.\n"
+            "  set_tx <percentage>          : Set TX power (manual mode only).\n"
+            "  get statistics               : Get current RX_ANT data and PKT statistics.\n"
+        );
+    } else if (strcasecmp(command_str, "get statistics") == 0) {
+        // Prepare statistics
+        char stats[1024];
+        snprintf(stats, sizeof(stats),
+            "Current Statistics:\n"
+            "  EMA RSSI: %.2f dBm\n"
+            "  EMA SNR: %.2f dB\n"
+            "  Total Packets: %" PRIu64 "\n"
+            "  Lost Packets: %" PRIu64 "\n"
+            "  Unrecoverable Packets: %" PRIu64 "\n",
+            config->ema_rssi,
+            config->ema_snr,
+            config->total_packets,
+            config->lost_packets,
+            config->unrecoverable_packets
+        );
+        snprintf(response, sizeof(response), "%s", stats);
+    } else if (strncmp(command_str, "run command ", 12) == 0) {
+        // Execute arbitrary system command
+        char *cmd = command_str + 12;
+
+        if (config->verbose) {
+            printf("Executing command: %s\n", cmd);
+        }
+
+        pid_t pid = fork();
+        if (pid == -1) {
+            perror("fork");
+            snprintf(response, sizeof(response), "Error: Failed to fork process.\n");
+        } else if (pid == 0) {
+            // Child process
+            execlp("sh", "sh", "-c", cmd, (char *)NULL);
+            // If execlp returns, an error occurred
+            perror("execlp");
+            _exit(EXIT_FAILURE);
+        } else {
+            // Parent process
+            int status;
+            waitpid(pid, &status, 0);
+            snprintf(response, sizeof(response), "Command executed: %s\n", cmd);
+        }
+    } else if (strncmp(command_str, "set ", 4) == 0) {
+        // Set command
+        char *set_cmd = command_str + 4;
+
+        if (strncmp(set_cmd, "target rssi ", 12) == 0) {
+            char *value_str = set_cmd + 12;
+            int value = (int)strtol(value_str, NULL, 10);
+            config->target_value = value;
+            config->pid_control_type = PID_CONTROL_RSSI;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "Target RSSI set to %d dBm.\n", value);
+            if (config->verbose) {
+                printf("Target RSSI set to %d dBm via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "target snr ", 11) == 0) {
+            char *value_str = set_cmd + 11;
+            int value = (int)strtol(value_str, NULL, 10);
+            config->target_value = value;
+            config->pid_control_type = PID_CONTROL_SNR;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "Target SNR set to %d dB.\n", value);
+            if (config->verbose) {
+                printf("Target SNR set to %d dB via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "pid rssi", 8) == 0) {
+            config->pid_control_type = PID_CONTROL_RSSI;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "PID control set to RSSI.\n");
+            if (config->verbose) {
+                printf("PID control set to RSSI via command.\n");
+            }
+        } else if (strncmp(set_cmd, "pid snr", 7) == 0) {
+            config->pid_control_type = PID_CONTROL_SNR;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "PID control set to SNR.\n");
+            if (config->verbose) {
+                printf("PID control set to SNR via command.\n");
+            }
+        } else if (strncmp(set_cmd, "tx-min ", 7) == 0) {
+            char *value_str = set_cmd + 7;
+            int value = (int)strtol(value_str, NULL, 10);
+            if (value < 100 || value > 3000) {
+                snprintf(response, sizeof(response), "Error: Invalid tx-min value. Must be between 100 and 3000.\n");
+            } else {
+                value = ROUND_UP_TO_NEAREST_100(value);
+                config->tx_power_min = value;
+                if (config->tx_power_min > config->tx_power_max) {
+                    config->tx_power_max = config->tx_power_min;
+                }
+                snprintf(response, sizeof(response), "TX power min set to %d mBm.\n", value);
+                if (config->verbose) {
+                    printf("TX power min set to %d mBm via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "tx-max ", 7) == 0) {
+            char *value_str = set_cmd + 7;
+            int value = (int)strtol(value_str, NULL, 10);
+            if (value < 100 || value > 3000) {
+                snprintf(response, sizeof(response), "Error: Invalid tx-max value. Must be between 100 and 3000.\n");
+            } else {
+                value = ROUND_UP_TO_NEAREST_100(value);
+                config->tx_power_max = value;
+                if (config->tx_power_max < config->tx_power_min) {
+                    config->tx_power_min = config->tx_power_max;
+                }
+                snprintf(response, sizeof(response), "TX power max set to %d mBm.\n", value);
+                if (config->verbose) {
+                    printf("TX power max set to %d mBm via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "fec-limit ", 10) == 0) {
+            char *value_str = set_cmd + 10;
+            unsigned int value = (unsigned int)strtoul(value_str, NULL, 10);
+            if (value < 1 || value > 100) {
+                snprintf(response, sizeof(response), "Error: Invalid fec-limit. Must be between 1 and 100.\n");
+            } else {
+                config->fec_limit = value;
+                snprintf(response, sizeof(response), "FEC limit set to %u.\n", value);
+                if (config->verbose) {
+                    printf("FEC limit set to %u via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "lost-limit ", 11) == 0) {
+            char *value_str = set_cmd + 11;
+            unsigned int value = (unsigned int)strtoul(value_str, NULL, 10);
+            if (value < 1 || value > 100) {
+                snprintf(response, sizeof(response), "Error: Invalid lost-limit. Must be between 1 and 100.\n");
+            } else {
+                config->lost_limit = value;
+                snprintf(response, sizeof(response), "Lost limit set to %u.\n", value);
+                if (config->verbose) {
+                    printf("Lost limit set to %u via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "recover-timeout ", 16) == 0) {
+            char *value_str = set_cmd + 16;
+            int value = (int)strtol(value_str, NULL, 10);
+            if (value < 1) {
+                snprintf(response, sizeof(response), "Error: Invalid recover-timeout. Must be greater than 0.\n");
+            } else {
+                config->recover_timeout = value;
+                snprintf(response, sizeof(response), "Recover timeout set to %d seconds.\n", value);
+                if (config->verbose) {
+                    printf("Recover timeout set to %d seconds via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "set-delay ", 10) == 0) {
+            char *value_str = set_cmd + 10;
+            int value = (int)strtol(value_str, NULL, 10);
+            if (value < 0) {
+                snprintf(response, sizeof(response), "Error: Invalid set-delay. Must be non-negative.\n");
+            } else {
+                config->set_delay_ms = value;
+                snprintf(response, sizeof(response), "Set delay set to %d ms.\n", value);
+                if (config->verbose) {
+                    printf("Set delay set to %d ms via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "rx-ant-timeout ", 15) == 0) {
+            char *value_str = set_cmd + 15;
+            int value = (int)strtol(value_str, NULL, 10);
+            if (value < 1) {
+                snprintf(response, sizeof(response), "Error: Invalid rx-ant-timeout. Must be greater than 0.\n");
+            } else {
+                config->rx_ant_timeout = value;
+                snprintf(response, sizeof(response), "RX_ANT timeout set to %d seconds.\n", value);
+                if (config->verbose) {
+                    printf("RX_ANT timeout set to %d seconds via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "kp ", 3) == 0) {
+            char *value_str = set_cmd + 3;
+            double value = strtod(value_str, NULL);
+            config->Kp = value;
+            snprintf(response, sizeof(response), "Kp set to %.2f.\n", value);
+            if (config->verbose) {
+                printf("Kp set to %.2f via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "ki ", 3) == 0) {
+            char *value_str = set_cmd + 3;
+            double value = strtod(value_str, NULL);
+            config->Ki = value;
+            snprintf(response, sizeof(response), "Ki set to %.2f.\n", value);
+            if (config->verbose) {
+                printf("Ki set to %.2f via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "kd ", 3) == 0) {
+            char *value_str = set_cmd + 3;
+            double value = strtod(value_str, NULL);
+            config->Kd = value;
+            snprintf(response, sizeof(response), "Kd set to %.2f.\n", value);
+            if (config->verbose) {
+                printf("Kd set to %.2f via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "error-threshold ", 16) == 0) {
+            char *value_str = set_cmd + 16;
+            double value = strtod(value_str, NULL);
+            if (value <= 0.0) {
+                snprintf(response, sizeof(response), "Error: Invalid error-threshold. Must be greater than 0.\n");
+            } else {
+                config->error_threshold = value;
+                snprintf(response, sizeof(response), "Error threshold set to %.2f.\n", value);
+                if (config->verbose) {
+                    printf("Error threshold set to %.2f via command.\n", value);
+                }
+            }
+        } else if (strncmp(set_cmd, "hysteresis-offset-rssi ", 23) == 0) {
+            char *value_str = set_cmd + 23;
+            int value = (int)strtol(value_str, NULL, 10);
+            config->hysteresis_offset_rssi = value;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "Hysteresis offset RSSI set to %d.\n", value);
+            if (config->verbose) {
+                printf("Hysteresis offset RSSI set to %d via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "hysteresis-offset-snr ", 22) == 0) {
+            char *value_str = set_cmd + 22;
+            int value = (int)strtol(value_str, NULL, 10);
+            config->hysteresis_offset_snr = value;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "Hysteresis offset SNR set to %d.\n", value);
+            if (config->verbose) {
+                printf("Hysteresis offset SNR set to %d via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "dead-band-half-rssi ", 20) == 0) {
+            char *value_str = set_cmd + 20;
+            int value = (int)strtol(value_str, NULL, 10);
+            config->dead_band_half_rssi = value;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "Dead band half RSSI set to %d.\n", value);
+            if (config->verbose) {
+                printf("Dead band half RSSI set to %d via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "dead-band-half-snr ", 19) == 0) {
+            char *value_str = set_cmd + 19;
+            int value = (int)strtol(value_str, NULL, 10);
+            config->dead_band_half_snr = value;
+            initialize_hysteresis(config);
+            snprintf(response, sizeof(response), "Dead band half SNR set to %d.\n", value);
+            if (config->verbose) {
+                printf("Dead band half SNR set to %d via command.\n", value);
+            }
+        } else if (strncmp(set_cmd, "alink ", 6) == 0) {
+            char *value = set_cmd + 6;
+            if (strcasecmp(value, "on") == 0 || strcmp(value, "1") == 0) {
+                config->alink_enabled = 1;
+                initialize_hysteresis(config);
+                snprintf(response, sizeof(response), "A-Link enabled.\n");
+                if (config->verbose) {
+                    printf("A-Link enabled via command.\n");
+                }
+            } else if (strcasecmp(value, "off") == 0 || strcmp(value, "0") == 0) {
+                config->alink_enabled = 0;
+                snprintf(response, sizeof(response), "A-Link disabled.\n");
+                if (config->verbose) {
+                    printf("A-Link disabled via command.\n");
+                }
+            } else {
+                snprintf(response, sizeof(response), "Error: Invalid value for alink. Use 'on' or 'off'.\n");
+            }
+        } else if (strncmp(set_cmd, "mode manual", 11) == 0) {
+            // Switch to manual mode
+            config->manual_mode_enabled = 1;
+            config->pid_control_enabled = 0;
+            snprintf(response, sizeof(response), "Switched to manual mode.\n");
+            if (config->verbose) {
+                printf("Switched to manual mode via command.\n");
+            }
+        } else if (strncmp(set_cmd, "mode pid", 8) == 0) {
+            // Switch back to PID control
+            config->manual_mode_enabled = 0;
+            config->pid_control_enabled = 1;
+            snprintf(response, sizeof(response), "Switched to PID mode.\n");
+            if (config->verbose) {
+                printf("Switched to PID mode via command.\n");
+            }
+        } else {
+            snprintf(response, sizeof(response), "Error: Unknown set command.\n");
+        }
+    } else if (config->manual_mode_enabled && strncmp(command_str, "set_tx ", 7) == 0) {
+        // Manual mode set_tx command
+        char *percent_str = command_str + 7;
+        int percent = (int)strtol(percent_str, NULL, 10);
+        if (percent < 1 || percent > 100) {
+            snprintf(response, sizeof(response), "Error: Invalid percentage. Must be between 1 and 100.\n");
+        } else {
+            // Calculate TX power
+            int tx_power_range = config->tx_power_max - config->tx_power_min;
+            int tx_power = config->tx_power_min + (tx_power_range * (percent - 1)) / 99;
+            // Round to nearest 100
+            tx_power = ROUND_UP_TO_NEAREST_100(tx_power);
+            // Ensure tx_power is within min and max
+            if (tx_power < config->tx_power_min) tx_power = config->tx_power_min;
+            if (tx_power > config->tx_power_max) tx_power = config->tx_power_max;
+            // Adjust TX power
+            if (adjust_tx_power(config, tx_power) == 0) {
+                snprintf(response, sizeof(response), "TX power set to %d%% (%d mBm)\n", percent, tx_power);
+            } else {
+                snprintf(response, sizeof(response), "Error: Failed to set TX power.\n");
+            }
+        }
+    } else {
+        // Assume data parsing
+        struct timespec timestamp;
+        clock_gettime(CLOCK_MONOTONIC, &timestamp);
+        process_line(config, buffer, DATA_SOURCE_SOCKET, &timestamp);
+        snprintf(response, sizeof(response), "Data processed.\n");
+    }
+
+    // Send response
+    send(new_socket, response, strlen(response), 0);
+
+    // Close the connection
+    close(new_socket);
+}
