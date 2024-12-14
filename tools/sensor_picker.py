@@ -2,18 +2,20 @@
 import curses
 import math
 
-# Updated sensor modes based on user's last provided data
+# Updated sensor modes as requested
 sensors = {
     "IMX415": [
-        {"resolution": (3248, 1828), "fps": 60},  # Index 2
-        {"resolution": (1920, 1080), "fps": 90}, # Index 3
-        {"resolution": (1920, 816),  "fps": 120} # Index 4
+        {"resolution": (3840, 2160), "fps": 30},  # Index 0
+        {"resolution": (3200, 1800), "fps": 40},  # Index 1
+        {"resolution": (2720, 1528), "fps": 60},  # Index 2
+        {"resolution": (1920, 1080), "fps": 90},  # Index 3
+        {"resolution": (1920, 816),  "fps": 120}  # Index 4
     ],
     "IMX335": [
-        {"resolution": (2560, 1920), "fps": 30},   # Index 0
-        {"resolution": (2560, 1920), "fps": 70},   # Index 1
-        {"resolution": (2560, 1440), "fps": 90},   # Index 2
-        {"resolution": (2560, 1080), "fps": 120}   # Index 3
+        {"resolution": (2560, 1920), "fps": 30},  # Index 0
+        {"resolution": (2512, 1416), "fps": 70},  # Index 1
+        {"resolution": (2208, 1248), "fps": 90},  # Index 2
+        {"resolution": (1920, 1080), "fps": 120}  # Index 3
     ]
 }
 
@@ -196,7 +198,6 @@ def main(stdscr):
 
     # Always include 1920x1080 and 1280x720 if missing
     forced_resolutions = [(1920,1080), (1280,720)]
-    adjusted_forced = []
     for frw, frh in forced_resolutions:
         # Adjust them to chosen aspect ratio
         adj_w, adj_h = calculate_aspect_fit(frw, frh, ar_w, ar_h)
