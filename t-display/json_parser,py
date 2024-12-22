@@ -1,0 +1,290 @@
+import time
+import wifi
+import socketpool
+import json
+import supervisor
+import board
+import digitalio
+import displayio
+import paralleldisplaybus
+import adafruit_st7789
+from adafruit_display_text import label
+from adafruit_bitmap_font import bitmap_font
+
+# Configuration
+SSID = "openipc"
+HOST = "192.168.1.49"
+PORT = 8103
+TIMEOUT = 10
+
+# GPIO14 Button setup
+restart_button = digitalio.DigitalInOut(board.IO14)
+restart_button.direction = digitalio.Direction.INPUT
+restart_button.pull = digitalio.Pull.UP
+restart_button_was_pressed = False
+
+# Release any resources currently in use for the displays
+displayio.release_displays()
+
+# Initialize display power
+lcd_power = digitalio.DigitalInOut(board.LCD_POWER_ON)
+lcd_power.switch_to_output(value=True)
+
+# Setup parallel bus
+display_bus = paralleldisplaybus.ParallelBus(
+    data_pins=(board.LCD_D0, board.LCD_D1, board.LCD_D2, board.LCD_D3,
+               board.LCD_D4, board.LCD_D5, board.LCD_D6, board.LCD_D7),
+    command=board.LCD_DC,
+    chip_select=board.LCD_CS,
+    write=board.LCD_WR,
+    read=board.LCD_RD,
+    reset=board.LCD_RST,
+    frequency=15_000_000,
+)
+
+# Initialize display with 90-degree rotation
+display = adafruit_st7789.ST7789(display_bus, width=170, height=320, rotation=180, colstart=35)
+
+# Create a main display group
+main_group = displayio.Group()
+
+# Add text output using Arial_Bold_12.bdf font
+font = bitmap_font.load_font("/fonts/Arial_Bold_12.bdf")
+text_area = label.Label(font, text="Initializing...", color=0xFFFFFF, x=5, y=5)
+main_group.append(text_area)
+
+# Calculate line height dynamically from the font
+font_bounding_box = font.get_bounding_box()
+line_height = font_bounding_box[1] + 5  # Text height plus 5 pixels spacing
+
+# Add a group to hold bars
+bars_group = displayio.Group()
+main_group.append(bars_group)
+
+# Add FEC ratio text
+fec_ratio_label = label.Label(font, text="", color=0xFFFFFF, x=5, y=260)
+main_group.append(fec_ratio_label)
+
+# Add lost and FEC counts at the bottom
+lost_fec_label = label.Label(font, text="", color=0xFFFFFF, x=5, y=290)
+main_group.append(lost_fec_label)
+
+# Assign the main group to the display's root_group
+display.root_group = main_group
+
+# Variables to track previous state for flicker reduction
+previous_text = []
+previous_bars = []
+
+# Function to create a bar
+def create_bar(x, y, width, height, color):
+    bitmap = displayio.Bitmap(width, height, 1)  # 1 color
+    palette = displayio.Palette(1)
+    palette[0] = color  # Assign the color to the palette
+    return displayio.TileGrid(bitmap, pixel_shader=palette, x=x, y=y)
+
+# Function to parse the ant field into IP, WLAN ID, and antenna index
+def parse_ant_field(ant_value):
+    ip_part = (ant_value >> 32) & 0xFFFFFFFF
+    wlan_idx = (ant_value >> 8) & 0xFFFFFF
+    antenna_idx = ant_value & 0xFF
+    ip_address = ".".join(str((ip_part >> (8 * i)) & 0xFF) for i in reversed(range(4)))
+    return ip_address, wlan_idx, antenna_idx
+
+# Function to determine bar color
+def get_rssi_color(rssi):
+    if rssi >= -50:
+        return 0x00FF00  # Green
+    elif rssi >= -65:
+        return 0xFFFF00  # Yellow
+    elif rssi >= -80:
+        return 0xFFA500  # Orange
+    else:
+        return 0xFF0000  # Red
+
+def get_efficiency_color(efficiency):
+    if efficiency >= 1.0:
+        return 0x00FF00  # Green
+    elif efficiency >= 0.8:
+        return 0xFFFF00  # Yellow
+    elif efficiency >= 0.6:
+        return 0xFFA500  # Orange
+    else:
+        return 0xFF0000  # Red
+
+# Function to update the display with current data
+def refresh_ui(antenna_data, lost, fec_rec, fec_k, fec_n):
+    """
+    Refresh the display elements while minimizing flicker.
+    """
+    global previous_bars, previous_text
+
+    new_lines = []
+    for ip, wlan_data in antenna_data.items():
+        for wlan_idx, (rssi, out_ratio) in wlan_data.items():
+            # Prepare text for this IP and WLAN
+            new_lines.append(f"{ip}:{wlan_idx} R={rssi} E={out_ratio}%")
+
+    # Update text only if changed
+    if new_lines != previous_text:
+        text_area.text = "\n".join(new_lines[:8])  # Limit lines to fit screen
+        previous_text = new_lines
+
+    # Update bars only if changed
+    new_bars = []
+    bar_y_offset = 5 + len(new_lines) * line_height  # Place bars below text
+    for ip, wlan_data in antenna_data.items():
+        for wlan_idx, (rssi, out_ratio) in wlan_data.items():
+            # Calculate bar dimensions/colors
+            rssi_length = int((rssi + 90) / 50 * 170)  # Scale -90 to -40 to 0-170
+            rssi_color = get_rssi_color(rssi)
+            eff_value = out_ratio / 100  # Convert percentage to scale of 0 to 1
+            eff_length = int((eff_value - 0.5) / 0.5 * 170)  # Scale 0.5 to 1 to 0-170
+            eff_color = get_efficiency_color(eff_value)
+
+            # Add bar data to new_bars for comparison
+            new_bars.append((rssi_length, rssi_color, bar_y_offset))
+            new_bars.append((eff_length, eff_color, bar_y_offset + 5))
+
+            bar_y_offset += 14  # Adjust for the next set of bars
+
+    if new_bars != previous_bars:
+        while len(bars_group) > 0:
+            bars_group.pop()  # Clear all previous bars
+        for length, color, y in new_bars:
+            bars_group.append(create_bar(0, y, length, 4, color))
+        previous_bars = new_bars
+
+    # Calculate FEC percentage
+    fec_ratio = round((fec_n / fec_k) * 100 if fec_k > 0 else 0)
+
+    # Update FEC ratio
+    fec_ratio_text = f"FEC: {fec_k}:{fec_n} Et={fec_ratio}%"
+    if fec_ratio_label.text != fec_ratio_text:
+        fec_ratio_label.text = fec_ratio_text
+
+    # Update Lost and FEC counts only if changed
+    lost_fec_text = f"Lost={lost} FEC={fec_rec}"
+    if lost_fec_label.text != lost_fec_text:
+        lost_fec_label.text = lost_fec_text
+        lost_fec_label.color = (
+            0xFF0000 if lost > 0 else 0x800080 if fec_rec > 0 else 0xFFFFFF
+        )
+
+# Function to check for GPIO14 button press
+def check_restart_button():
+    global restart_button_was_pressed
+    if not restart_button.value:
+        if not restart_button_was_pressed:
+            restart_button_was_pressed = True
+            print("\nGPIO14 button pressed. Rebooting program...")
+            text_area.text = "Restarting..."
+            time.sleep(0.5)
+            supervisor.reload()
+    else:
+        restart_button_was_pressed = False
+
+# Function to connect to Wi-Fi
+def connect_to_wifi():
+    while True:
+        try:
+            print("Connecting to Wi-Fi...")
+            wifi.radio.connect(SSID)
+            print(f"Connected to Wi-Fi! IP address: {wifi.radio.ipv4_address}")
+            text_area.text = "Wi-Fi Connected."
+            return "Connected"
+        except Exception as e:
+            print(f"Wi-Fi connection failed: {e}")
+            text_area.text = "Wi-Fi failed.\nRetrying..."
+            time.sleep(2)
+
+# Function to connect to the data server
+def connect_to_server():
+    while True:
+        try:
+            print(f"Connecting to server at {HOST}:{PORT}...")
+            pool = socketpool.SocketPool(wifi.radio)
+            sock = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+            sock.connect((HOST, PORT))
+            print("Connected to server!")
+            text_area.text = "Server Connected."
+            return sock
+        except Exception as e:
+            print(f"Server connection failed: {e}")
+            text_area.text = "Server failed.\nRetrying..."
+            time.sleep(2)
+
+# Main loop
+print("Starting program...")
+wifi_status = connect_to_wifi()
+
+antenna_data = {}
+last_update = time.monotonic()
+last_received_time = time.monotonic()
+while True:
+    check_restart_button()
+    try:
+        sock = connect_to_server()
+        buffer = bytearray(2048)
+        leftover = b""
+        while True:
+            check_restart_button()
+            if time.monotonic() - last_received_time > TIMEOUT:
+                print("No data received for 10 seconds. Reconnecting...")
+                text_area.text = "No data.\nReconnecting..."
+                break
+            try:
+                bytes_received = sock.recv_into(buffer)
+                if bytes_received == 0:
+                    print("Server closed the connection.")
+                    text_area.text = "Server Closed.\nReconnecting..."
+                    break
+                last_received_time = time.monotonic()
+                data = leftover + buffer[:bytes_received]
+                json_messages = data.split(b"\n")
+                leftover = json_messages.pop()
+                for message in json_messages:
+                    try:
+                        json_data = json.loads(message.decode("utf-8"))
+                        if json_data.get("type") == "rx" and json_data.get("id") == "video rx":
+                            rx_ant_stats = json_data.get("rx_ant_stats", [])
+                            if not rx_ant_stats:
+                                print("No antenna data in JSON. Waiting for updates...")
+                                continue
+                            packets = json_data.get("packets", {})
+                            lost = packets.get("lost", [0])[0]
+                            fec_rec = packets.get("fec_rec", [0])[0]
+                            out = packets.get("out", [1])[0]
+                            session = json_data.get("session", {})
+                            fec_k = session.get("fec_k", 1)
+                            fec_n = session.get("fec_n", 1)
+
+                            # Aggregate data by IP and WLAN ID
+                            ip_wlan_data = {}
+                            for ant in rx_ant_stats:
+                                ant_value = ant.get("ant", 0)
+                                ip_address, wlan_idx, _ = parse_ant_field(ant_value)
+                                ip_short = ".".join(ip_address.split(".")[-2:])
+                                rssi_avg = ant.get("rssi_avg", -100)
+                                pkt_recv = ant.get("pkt_recv", 0)
+                                out_ratio = round((pkt_recv / out) * 100 if out > 0 else 0)
+
+                                if ip_short not in ip_wlan_data:
+                                    ip_wlan_data[ip_short] = {}
+                                if wlan_idx not in ip_wlan_data[ip_short] or rssi_avg > ip_wlan_data[ip_short][wlan_idx][0]:
+                                    ip_wlan_data[ip_short][wlan_idx] = (rssi_avg, out_ratio)
+
+                            # Update the display every ~30 FPS
+                            if time.monotonic() - last_update >= 0.033:
+                                refresh_ui(ip_wlan_data, lost, fec_rec, fec_k, fec_n)
+                                last_update = time.monotonic()
+                    except ValueError:
+                        print("JSON parse error: Invalid data received.")
+                        text_area.text = "JSON Error."
+            except OSError as e:
+                print(f"Data receive error: {e}")
+                text_area.text = "Data Error.\nReconnecting..."
+                break
+    except Exception as e:
+        print(f"Error: {e}")
+        text_area.text = "General Error.\nReconnecting..."
