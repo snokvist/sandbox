@@ -227,7 +227,7 @@ if __name__ == "__main__":
         update_plot(lines, current_data, selected_keys, ax)
 
     if refresh_rate:
-        ani = FuncAnimation(fig, update, interval=refresh_rate * 1000)
+        ani = FuncAnimation(fig, update, interval=refresh_rate * 1000, cache_frame_data=False)
     else:
         update(0)  # Static plot
 
