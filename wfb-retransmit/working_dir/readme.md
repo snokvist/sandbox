@@ -1,3 +1,8 @@
+Section for wfb_ng setup:
+GO HERE
+
+
+
 SCTP (Stream Control Transmission Protocol) is a transport-layer protocol designed to combine features of both TCP and UDP while introducing unique enhancements. SCTP provides reliable, message-oriented communication with support for multi-streaming and multi-homing, making it suitable for a wide range of applications, from telecommunications signaling to real-time streaming.
 
 How SCTP Works: SCTP establishes an association (similar to a connection in TCP) between two endpoints. Data is transmitted as chunks within messages, and each chunk is assigned a Transmission Sequence Number (TSN) for tracking. The protocol uses Selective Acknowledgments (SACKs) to inform the sender about received and missing chunks, enabling efficient retransmissions. Multi-streaming allows independent data streams within a single association, preventing head-of-line blocking. Multi-homing supports fault tolerance by enabling communication over multiple network paths, switching automatically if the primary path fails. Unlike TCP, SCTP preserves message boundaries, ensuring application-level messages remain intact.
