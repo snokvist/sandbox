@@ -7,15 +7,13 @@
  *   - Inter-arrival time & packet-size ASCII histograms
  *   - UDP forwarding to 127.0.0.1:5600
  *   - Ncurses UI that updates every 2 seconds
- *   - Threaded approach with indefinite re-listen:
- *       * Main thread repeatedly accept() an SCTP connection
- *         => spawn an RX thread for each accepted conn
- *         => if peer disconnects, we close and go back to accept().
- *       * The UI thread runs the entire time, showing continuous stats.
- *   - Shows "In listen mode for X seconds" in the UI.
+ *   - Threaded approach with indefinite re-listen using poll() in the accept loop
+ *       * Ensures Ctrl+C can interrupt even without a new connection
+ *   - SCTP_ACK_FREQ setting for controlling ACK frequency
  *
  * Usage:
- *   ./sctp_receiver_ncurses_relisten [--port 6600 ...]
+ *   ./sctp_receiver_ncurses_relisten [OPTIONS]
+ *   Example: ./sctp_receiver_ncurses_relisten --port 7700 --ack-freq 5
  *   Press Ctrl+C to exit.
  ******************************************************************************/
 
@@ -32,8 +30,9 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
-#include <linux/sockios.h>  // For SIOCINQ / SIOCOUTQ on Linux
+#include <linux/sockios.h> 
 #include <pthread.h>
+#include <poll.h>
 #include <curses.h>
 
 #ifndef SOL_SCTP
@@ -48,15 +47,14 @@
 #define DEFAULT_PR_SCTP_TTL     50     // ms
 #define DEFAULT_DELAYED_ACK_MS  10     // ms
 #define DEFAULT_BUFFER_SIZE_KB  16
+#define DEFAULT_ACK_FREQ        10     // e.g., ACK every 10 packets
 
 /* We'll do a 10-second ring buffer window,
    but update the Ncurses interface every 2 seconds. */
 #define STATS_UPDATE_SEC        2
 
 static volatile int g_running = 1; /* For clean shutdown on Ctrl+C */
-
-/* We track when we started listening, to show "X seconds in listen mode." */
-static time_t g_listen_start_time = 0;
+static time_t g_listen_start_time = 0; /* Track how long we've been in listen mode */
 
 /* -------------------------------------------------------------------------
  * Signal handler for Ctrl+C
@@ -94,22 +92,20 @@ static void parse_rtp_header(const unsigned char *buf, rtp_header_t *hdr) {
 }
 
 /* -------------------------------------------------------------------------
- * Partial Reliability Logic (missing, recovered, irretrievable)
- * We'll track missing sequences in an array keyed by seq (16 bits).
+ * Partial Reliability Logic
  * ------------------------------------------------------------------------- */
 typedef struct {
     int missing;                // 1 if missing
     struct timespec detect_ts;  // when gap discovered
 } lost_seq_t;
 
-/* We'll allocate globally, but re-initialize on each new SCTP connection. */
-static lost_seq_t g_lost_seq[65536]; /* for 16-bit seq numbers */
-static int g_pr_sctp_ttl = DEFAULT_PR_SCTP_TTL; /* in ms */
+/* We'll allocate globally, but reinit for each new SCTP connection. */
+static lost_seq_t g_lost_seq[65536]; 
+static int g_pr_sctp_ttl = DEFAULT_PR_SCTP_TTL; /* ms */
 
 static int g_first_packet = 1;
 static unsigned short g_expected_seq = 0;
 
-/* Reset partial reliability state for each new association */
 static void reset_partial_reliability_state()
 {
     memset(g_lost_seq, 0, sizeof(g_lost_seq));
@@ -119,13 +115,6 @@ static void reset_partial_reliability_state()
 
 /* -------------------------------------------------------------------------
  * 10-second ring buffer events
- *   - ARRIVAL: a packet arrived
- *   - RECOVERED: a missing packet arrived out-of-order
- *   - IRRETRIEVABLE: a missing packet timed out
- *
- * We store:
- *   - bytes: for ARRIVAL
- *   - intra_ms: inter-arrival time in ms for ARRIVAL
  * ------------------------------------------------------------------------- */
 typedef enum {
     EVT_ARRIVAL,
@@ -143,13 +132,11 @@ typedef struct {
 
 #define MAX_EVENTS 20000
 static event_t g_events[MAX_EVENTS];
-static int g_evt_head = 0; // insertion index
-static int g_evt_tail = 0; // oldest event index
+static int g_evt_head = 0;
+static int g_evt_tail = 0;
 
-/* We need a mutex to protect ring buffer & partial reliability data. */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Overall totals since start */
 static unsigned long g_total_packets = 0;
 static unsigned long g_total_bytes   = 0;
 
@@ -160,15 +147,18 @@ static int g_first_arrival = 1;
 /* Ncurses window pointer */
 static WINDOW *g_win = NULL;
 
-/* The UDP socket is global for convenience. We keep it open across re-listens. */
+/* The UDP socket is global. We keep it open across re-listens. */
 static int g_udp_sock = -1;
-static struct sockaddr_in g_udp_dest; /* 127.0.0.1:5600 */
+static struct sockaddr_in g_udp_dest; 
 
 /* We keep track of the current SCTP connection FD in the UI. -1 => no conn. */
 static int g_current_conn_fd = -1;
 
 /* The listening socket */
-static int do_listen_fd = -1;
+static int g_listen_fd = -1;
+
+/* Ack freq, default 10, can be set by user. */
+static int g_ack_freq = DEFAULT_ACK_FREQ;
 
 /* -------------------------------------------------------------------------
  * Time helpers
@@ -192,7 +182,7 @@ static double timespec_diff_ms(const struct timespec *end,
 }
 
 /* -------------------------------------------------------------------------
- * Event ring buffer: add & prune (with concurrency lock)
+ * Event ring buffer: add & prune
  * ------------------------------------------------------------------------- */
 static void add_event(event_type_t type, double recovery_time,
                       size_t bytes, double intra_ms)
@@ -208,7 +198,6 @@ static void add_event(event_type_t type, double recovery_time,
 
     g_evt_head = (g_evt_head + 1) % MAX_EVENTS;
     if (g_evt_head == g_evt_tail) {
-        /* ring buffer full, overwrite oldest */
         g_evt_tail = (g_evt_tail + 1) % MAX_EVENTS;
     }
 }
@@ -229,7 +218,6 @@ static void prune_old_events() {
 
 /* -------------------------------------------------------------------------
  * handle_packet_seq: partial reliability logic
- * Must be called under lock.
  * ------------------------------------------------------------------------- */
 static void handle_packet_seq(unsigned short seq) {
     if (g_first_packet) {
@@ -294,7 +282,7 @@ static void handle_packet_seq(unsigned short seq) {
 }
 
 /* -------------------------------------------------------------------------
- * /proc/net/sctp/snmp parsing for interesting counters
+ * /proc/net/sctp/snmp parsing
  * ------------------------------------------------------------------------- */
 typedef struct {
     int SctpCurrEstab;
@@ -328,7 +316,6 @@ static int parse_sctp_snmp(sctp_snmp_t *out)
 
 /* -------------------------------------------------------------------------
  * Basic helper to get inq/outq for buffer usage
- * (May not work for SCTP on all kernels.)
  * ------------------------------------------------------------------------- */
 static int get_inq(int fd)
 {
@@ -352,8 +339,7 @@ static int get_outq(int fd)
 }
 
 /* -------------------------------------------------------------------------
- * Building histograms for inter-arrival times and packet sizes
- * Must be called under lock if we read ring buffer.
+ * Building histograms
  * ------------------------------------------------------------------------- */
 static void build_intra_time_histogram(int hist[8]) {
     memset(hist,0,8*sizeof(int));
@@ -396,8 +382,7 @@ static void build_packet_size_histogram(int hist[8]){
 }
 
 /* -------------------------------------------------------------------------
- * The function that draws stats in the Ncurses window.
- * Called periodically by the UI thread.
+ * The function that draws stats in the Ncurses window
  * ------------------------------------------------------------------------- */
 static void draw_stats(int conn_fd)
 {
@@ -474,12 +459,12 @@ static void draw_stats(int conn_fd)
     /* Clear window first */
     werase(g_win);
 
-    /* Show how long we've been in "listen mode." */
+    /* Show how long we've been "listening." */
     time_t now_time = time(NULL);
     long seconds_listening = now_time - g_listen_start_time;
 
-    mvwprintw(g_win,0,0,"=== SCTP RECEIVER STATS (re-listen) - updates every 2s ===");
-    mvwprintw(g_win,1,0,"Listening for: %ld seconds", seconds_listening);
+    mvwprintw(g_win,0,0,"=== SCTP RECEIVER with poll-based re-listen - updates every 2s ===");
+    mvwprintw(g_win,1,0,"Listening for: %ld seconds, AckFreq=%d", seconds_listening, g_ack_freq);
 
     mvwprintw(g_win,3,0,"Last 10s Window:");
     mvwprintw(g_win,4,0,"  Arrivals:         %lu", arrivals);
@@ -488,7 +473,7 @@ static void draw_stats(int conn_fd)
     mvwprintw(g_win,7,0,"  Irretrievable:    %lu", irretrievable);
     mvwprintw(g_win,8,0,"  Avg Recovery (s): %.3f", avg_recovery);
     mvwprintw(g_win,9,0,"  Packets/s:        %.2f", pkts_sec);
-    mvwprintw(g_win,10,0," Mbits/s:           %.3f", mbits_sec);
+    mvwprintw(g_win,10,0,"  Mbits/s:          %.3f", mbits_sec);
 
     mvwprintw(g_win,12,0,"--- Overall Totals (Since Start) ---");
     mvwprintw(g_win,13,0,"  Total Packets:    %lu", g_total_packets);
@@ -581,7 +566,6 @@ static void draw_stats(int conn_fd)
 
 /* -------------------------------------------------------------------------
  * The "UI thread" function: updates Ncurses every 2 seconds
- * until g_running=0. The connection FD might be -1 if no current conn.
  * ------------------------------------------------------------------------- */
 static void *ui_thread_func(void *arg)
 {
@@ -596,11 +580,7 @@ static void *ui_thread_func(void *arg)
 }
 
 /* -------------------------------------------------------------------------
- * The "receiver thread" function:
- *   - read from SCTP conn_fd in a loop
- *   - partial reliability logic
- *   - forward to UDP
- *   - if peer closes => exit the thread
+ * The "receiver thread" function: read from SCTP, partial reliability, forward
  * ------------------------------------------------------------------------- */
 struct rx_thread_args {
     int conn_fd;
@@ -673,32 +653,24 @@ static void *rx_thread_func(void *varg)
 }
 
 /* -------------------------------------------------------------------------
- * Accept loop in main thread:
- *   - Binds and listens once
- *   - Repeatedly accept a new connection
- *   - Reset partial reliability state for that conn
- *   - Spawn an rx_thread
- *   - Wait for that thread to finish (peer close or error)
- *   - Then accept again, until Ctrl+C
+ * Setup the listening SCTP socket with poll-based accept
  * ------------------------------------------------------------------------- */
 static int setup_listening_socket(int port, int rto_min, int rto_max,
                                   int rto_init, int ack_time, int buf_kb)
 {
-    do_listen_fd= socket(AF_INET,SOCK_STREAM,IPPROTO_SCTP);
-    if(do_listen_fd<0){
+    g_listen_fd= socket(AF_INET,SOCK_STREAM,IPPROTO_SCTP);
+    if(g_listen_fd<0){
         perror("socket(AF_INET,SOCK_STREAM,IPPROTO_SCTP)");
         return -1;
     }
 
     int sock_buf_size= buf_kb*1024;
-    setsockopt(do_listen_fd, SOL_SOCKET, SO_SNDBUF,
-               &sock_buf_size,sizeof(sock_buf_size));
-    setsockopt(do_listen_fd, SOL_SOCKET, SO_RCVBUF,
-               &sock_buf_size,sizeof(sock_buf_size));
+    setsockopt(g_listen_fd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size,sizeof(sock_buf_size));
+    setsockopt(g_listen_fd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size,sizeof(sock_buf_size));
 
     int reuse=1;
-    setsockopt(do_listen_fd, SOL_SOCKET, SO_REUSEADDR,&reuse,sizeof(reuse));
-    setsockopt(do_listen_fd, SOL_SOCKET, SO_REUSEPORT,&reuse,sizeof(reuse));
+    setsockopt(g_listen_fd, SOL_SOCKET, SO_REUSEADDR,&reuse,sizeof(reuse));
+    setsockopt(g_listen_fd, SOL_SOCKET, SO_REUSEPORT,&reuse,sizeof(reuse));
 
     struct sockaddr_in addr;
     memset(&addr,0,sizeof(addr));
@@ -706,55 +678,121 @@ static int setup_listening_socket(int port, int rto_min, int rto_max,
     addr.sin_port=htons(port);
     addr.sin_addr.s_addr= INADDR_ANY;
 
-    if(bind(do_listen_fd,(struct sockaddr*)&addr,sizeof(addr))<0){
+    if(bind(g_listen_fd,(struct sockaddr*)&addr,sizeof(addr))<0){
         perror("bind()");
-        close(do_listen_fd);
-        do_listen_fd=-1;
+        close(g_listen_fd);
+        g_listen_fd=-1;
         return -1;
     }
 
-    if(listen(do_listen_fd,1)<0){
+    if(listen(g_listen_fd,1)<0){
         perror("listen()");
-        close(do_listen_fd);
-        do_listen_fd=-1;
+        close(g_listen_fd);
+        g_listen_fd=-1;
         return -1;
     }
 
-    /* SCTP options: RTO, PR-SCTP, delayed ACK, NODELAY */
+    /* SCTP options: RTO, PR-SCTP, delayed ACK, NODELAY, ACK_FREQ */
     {
         struct sctp_rtoinfo rtoinfo;
         memset(&rtoinfo,0,sizeof(rtoinfo));
         rtoinfo.srto_initial= rto_init;
         rtoinfo.srto_max    = rto_max;
         rtoinfo.srto_min    = rto_min;
-        setsockopt(do_listen_fd, SOL_SCTP, SCTP_RTOINFO,
+        setsockopt(g_listen_fd, SOL_SCTP, SCTP_RTOINFO,
                    &rtoinfo,sizeof(rtoinfo));
 
         struct sctp_prinfo prinfo;
         memset(&prinfo,0,sizeof(prinfo));
         prinfo.pr_policy= SCTP_PR_SCTP_TTL;
         prinfo.pr_value = g_pr_sctp_ttl;
-        setsockopt(do_listen_fd, SOL_SCTP, SCTP_PR_SUPPORTED,
+        setsockopt(g_listen_fd, SOL_SCTP, SCTP_PR_SUPPORTED,
                    &prinfo,sizeof(prinfo));
 
         struct sctp_assoc_value ack_delay;
         memset(&ack_delay,0,sizeof(ack_delay));
         ack_delay.assoc_id   = SCTP_FUTURE_ASSOC;
         ack_delay.assoc_value= ack_time;
-        setsockopt(do_listen_fd, SOL_SCTP, SCTP_DELAYED_ACK_TIME,
+        setsockopt(g_listen_fd, SOL_SCTP, SCTP_DELAYED_ACK_TIME,
                    &ack_delay,sizeof(ack_delay));
 
         int one=1;
-        setsockopt(do_listen_fd, SOL_SCTP, SCTP_NODELAY,
+        setsockopt(g_listen_fd, SOL_SCTP, SCTP_NODELAY,
                    &one,sizeof(one));
+
+        /* Set SCTP_ACK_FREQ (Linux-specific) to g_ack_freq */
+#ifdef SCTP_ACK_FREQ
+        setsockopt(g_listen_fd, IPPROTO_SCTP, SCTP_ACK_FREQ,
+                   &g_ack_freq, sizeof(g_ack_freq));
+#endif
     }
 
-    printf("Listening on SCTP port %d...\n",port);
-    return do_listen_fd;
+    printf("Listening on SCTP port %d (ack_freq=%d)...\n",port,g_ack_freq);
+    return g_listen_fd;
 }
 
 /* -------------------------------------------------------------------------
- * The UI thread is declared above; here's main
+ * Main accept loop using poll(), ensuring Ctrl+C is respected
+ * ------------------------------------------------------------------------- */
+static int poll_accept_loop()
+{
+    while(g_running){
+        struct pollfd pfd;
+        pfd.fd= g_listen_fd;
+        pfd.events= POLLIN;
+        pfd.revents=0;
+
+        int ret= poll(&pfd, 1, 1000); // 1s poll
+        if(ret<0){
+            if(errno==EINTR) continue;
+            perror("poll()");
+            return -1;
+        }
+        if(ret==0){
+            /* no event, check if still running */
+            continue;
+        }
+        if(pfd.revents & POLLIN){
+            struct sockaddr_in peer_addr;
+            socklen_t peer_len= sizeof(peer_addr);
+            int conn_fd= accept(g_listen_fd, (struct sockaddr*)&peer_addr,&peer_len);
+            if(conn_fd<0){
+                if(errno==EINTR || errno==ECONNABORTED) continue;
+                perror("accept()");
+                return -1;
+            }
+            printf("Accepted SCTP connection from %s:%u\n",
+                   inet_ntoa(peer_addr.sin_addr), ntohs(peer_addr.sin_port));
+
+            /* Reset partial reliability for this new association */
+            pthread_mutex_lock(&g_lock);
+            reset_partial_reliability_state();
+            g_first_arrival=1;
+            g_current_conn_fd= conn_fd;
+            pthread_mutex_unlock(&g_lock);
+
+            /* Spawn an RX thread for this connection */
+            pthread_t rx_thread;
+            struct rx_thread_args *args= malloc(sizeof(struct rx_thread_args));
+            args->conn_fd= conn_fd;
+            if(pthread_create(&rx_thread,NULL, &rx_thread_func,args)!=0){
+                perror("pthread_create(rx_thread)");
+                close(conn_fd);
+                pthread_mutex_lock(&g_lock);
+                g_current_conn_fd= -1;
+                pthread_mutex_unlock(&g_lock);
+                continue;
+            }
+
+            /* Wait for that thread to finish */
+            pthread_join(rx_thread,NULL);
+        }
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * main
  * ------------------------------------------------------------------------- */
 int main(int argc, char *argv[])
 {
@@ -766,6 +804,7 @@ int main(int argc, char *argv[])
     int buf_kb    = DEFAULT_BUFFER_SIZE_KB;
 
     g_pr_sctp_ttl = DEFAULT_PR_SCTP_TTL;
+    g_ack_freq    = DEFAULT_ACK_FREQ; // new param
 
     /* Record the start time of listening */
     g_listen_start_time = time(NULL);
@@ -786,6 +825,8 @@ int main(int argc, char *argv[])
             ack_time= atoi(argv[++i]);
         } else if(!strcmp(argv[i],"--buffer-kb") && i+1<argc){
             buf_kb= atoi(argv[++i]);
+        } else if(!strcmp(argv[i],"--ack-freq") && i+1<argc){
+            g_ack_freq= atoi(argv[++i]);
         } else if(!strcmp(argv[i],"--help")){
             printf("Usage: %s [OPTIONS]\n", argv[0]);
             printf("  --port <port>             (default=%d)\n", port);
@@ -795,6 +836,7 @@ int main(int argc, char *argv[])
             printf("  --pr-sctp-ttl <ms>        (default=%d)\n", g_pr_sctp_ttl);
             printf("  --delayed-ack-time <ms>   (default=%d)\n", ack_time);
             printf("  --buffer-kb <size>        (default=%d)\n", buf_kb);
+            printf("  --ack-freq <packets>      (default=%d)\n", g_ack_freq);
             exit(EXIT_SUCCESS);
         }
     }
@@ -809,7 +851,7 @@ int main(int argc, char *argv[])
     g_udp_sock= socket(AF_INET,SOCK_DGRAM,0);
     if(g_udp_sock<0){
         perror("socket(AF_INET,SOCK_DGRAM)");
-        close(do_listen_fd);
+        close(g_listen_fd);
         return 1;
     }
     memset(&g_udp_dest,0,sizeof(g_udp_dest));
@@ -830,54 +872,12 @@ int main(int argc, char *argv[])
         perror("pthread_create(ui_thread)");
         endwin();
         close(g_udp_sock);
-        close(do_listen_fd);
+        close(g_listen_fd);
         return 1;
     }
 
-    /* Repeatedly accept new connections until Ctrl+C. */
-    while(g_running){
-        struct sockaddr_in peer_addr;
-        socklen_t peer_len= sizeof(peer_addr);
-
-        int conn_fd= accept(do_listen_fd,(struct sockaddr*)&peer_addr,&peer_len);
-        if(conn_fd<0){
-            if(!g_running) break; /* interrupted by Ctrl+C? */
-            perror("accept()");
-            /* Sleep a bit, then continue. */
-            sleep(1);
-            continue;
-        }
-
-        printf("Accepted SCTP connection from %s:%u\n",
-               inet_ntoa(peer_addr.sin_addr), ntohs(peer_addr.sin_port));
-
-        /* Reset partial reliability for this new association */
-        pthread_mutex_lock(&g_lock);
-        reset_partial_reliability_state();
-        /* Also reset the "first arrival" logic for inter-arrival times: */
-        g_first_arrival=1;
-        /* Mark the current conn fd so the UI can track buffer usage, etc. */
-        g_current_conn_fd= conn_fd;
-        pthread_mutex_unlock(&g_lock);
-
-        /* Spawn an RX thread for this connection */
-        pthread_t rx_thread;
-        struct rx_thread_args *args= malloc(sizeof(struct rx_thread_args));
-        args->conn_fd= conn_fd;
-        if(pthread_create(&rx_thread,NULL, &rx_thread_func,args)!=0){
-            perror("pthread_create(rx_thread)");
-            close(conn_fd);
-            pthread_mutex_lock(&g_lock);
-            g_current_conn_fd= -1;
-            pthread_mutex_unlock(&g_lock);
-            sleep(1);
-            continue;
-        }
-
-        /* Wait until that thread finishes (peer closed or error).
-           Then we re-listen in the loop. */
-        pthread_join(rx_thread,NULL);
-    }
+    /* Use poll-based accept loop so we can break on Ctrl+C */
+    poll_accept_loop();
 
     /* Cleanup */
     g_running=0;
@@ -887,7 +887,7 @@ int main(int argc, char *argv[])
     endwin();
 
     if(g_udp_sock>=0) close(g_udp_sock);
-    if(do_listen_fd>=0) close(do_listen_fd);
+    if(g_listen_fd>=0) close(g_listen_fd);
 
     printf("Receiver exiting.\n");
     printf("Total packets received: %lu\n", g_total_packets);
