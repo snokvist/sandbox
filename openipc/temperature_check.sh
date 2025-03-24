@@ -3,29 +3,28 @@
 NORMAL_THRESHOLD=85    # Normal if below 85°C
 REBOOT_THRESHOLD=100   # Reboot if 100°C or higher
 
+# --- Get Adapter info ---
+for card in $(lsusb | awk '{print $6}' | sort | uniq); do
+    case "$card" in
+        "0bda:8812" | "0bda:881a" | "0b05:17d2" | "2357:0101" | "2604:0012")
+            driver=88XXau
+            ;;
+        "0bda:a81a")
+            driver=8812eu
+            ;;
+        "0bda:f72b" | "0bda:b733")
+            driver=8733bu
+            ;;
+    esac
+done
+wifi_adapter=""$driver""
+echo "Wifi adapter found: $driver"
+
 while true; do
     # --- Get VTX Temperature ---
     # Example output from ipcinfo --temp: "39.00"
     vtx_temp=$(ipcinfo --temp)
     vtx_int=$(echo "$vtx_temp" | cut -d. -f1)
-    
-    # --- Get Adapter Temperature ---
-    for card in $(lsusb | awk '{print $6}' | sort | uniq); do
-        case "$card" in
-            "0bda:8812" | "0bda:881a" | "0b05:17d2" | "2357:0101" | "2604:0012")
-                driver=88XXau
-                ;;
-            "0bda:a81a")
-                driver=8812eu
-                ;;
-            "0bda:f72b" | "0bda:b733")
-                driver=8733bu
-                ;;
-        esac
-    done
-    wifi_adapter=""$driver""
-    echo "Wifi adapter found: $driver"
-    
     
     adapter_temp=0
     if [ "$wifi_adapter" = "8733bu" ]; then
