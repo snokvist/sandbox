@@ -14,7 +14,7 @@
  *
  * Common use
  * ──────────
- *   ./ps4_crsf -d /dev/ttyUSB0 --baud 115200  -r 100        # quiet
+ *   ./ps4_crsf -d /dev/ttyUSB0 --baud 115200  -r 125        # quiet
  *   ./ps4_crsf --simulation --channels -r 50                # no UART
  *   ./ps4_crsf --stats --mode 1,2,3,5,4 --invert 5          # print timings + RX stats
  */
@@ -197,7 +197,7 @@ static void parse_invert(const char *str,int inv[16]){
 int main(int argc,char **argv)
 {
     const char *dev="/dev/ttyUSB0";
-    int baud=115200, rate=100;
+    int baud=115200, rate=125;
     int F_stats=0,F_sim=0,F_chan=0;
     const char *mode_str=NULL,*inv_str=NULL,*dead_str=NULL;
     int map[16],inv[16],dead[16];
@@ -228,12 +228,12 @@ int main(int argc,char **argv)
         case 3:   F_chan=1; break;
         default:
             fprintf(stderr,
- "Usage: %s [-d tty] [--baud N] [-r 50|100|250] "
+ "Usage: %s [-d tty] [--baud N] [-r 50|125|250] "
  "[--mode list] [--invert list] [--deadband list] "
  "[--stats] [--channels] [--simulation]\n",argv[0]); return 1;
         }
     }
-    if(rate!=50&&rate!=100&&rate!=250){ fprintf(stderr,"rate must be 50,100,250\n");return 1;}
+    if(rate!=50&&rate!=125&&rate!=250){ fprintf(stderr,"rate must be 50,125,250\n");return 1;}
 
     parse_list(mode_str,map,1);
     parse_invert(inv_str,inv);
